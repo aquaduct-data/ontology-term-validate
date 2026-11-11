@@ -4,13 +4,13 @@
 #   ontology-term-validate.sh [options] <path> [<path>...]
 #
 # WHY THIS EXISTS
-#   ga4gh/phenopacket-schema#451: the urothelial-carcinoma example writes
+#   ga4gh/phenopacket-schema#451: the urothelial-carcinoma example wrote
 #   `ontologyClass("NCIT:C5189", "Radical Cystoprostatectomy")`. NCIT:C5189 is
 #   a real, syntactically valid identifier — it just means "Breast Extraskeletal
 #   Osteosarcoma". The intended term is NCIT:C51899. Nothing in the build catches
 #   that, because the identifier parses and the label is only a string.
-#   Upstream maintainer cmungall asked, in that issue, for exactly this check:
-#   "add identifier/label validation for ontology-backed example terms so
+#   That issue, filed by cmungall, suggests this check: "It may also be useful
+#   to add identifier/label validation for ontology-backed example terms so
 #   unrelated but syntactically valid identifiers are caught automatically."
 #
 # WHAT IT DOES

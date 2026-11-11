@@ -8,10 +8,12 @@ Both are real, both parse, and a schema validator accepts either. If your code
 writes the first while its label says the second, nothing fails — the identifier
 is valid and the label is just a string.
 
-That exact defect sits in a published GA4GH Phenopacket example
-([ga4gh/phenopacket-schema#451](https://github.com/ga4gh/phenopacket-schema/issues/451)),
-where a maintainer asked for automated identifier/label validation so that
-unrelated but syntactically valid identifiers get caught. This is that check.
+That exact defect sat in a published GA4GH Phenopacket example until it was
+corrected in November 2026
+([ga4gh/phenopacket-schema#451](https://github.com/ga4gh/phenopacket-schema/issues/451)).
+The issue that reported it suggests adding identifier/label validation so that
+unrelated but syntactically valid identifiers are caught automatically. This is
+that check.
 
 ## What it does
 
