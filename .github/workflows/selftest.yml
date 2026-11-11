@@ -1,0 +1,71 @@
+# Workflow for the published checker repo. Proves BEHAVIOUR, not presence.
+name: Selftest
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly, off the hour. The tool depends on a live ontology service and on
+    # terms that move: two terms in published examples went obsolete under us.
+    # A tool that was right in September is a claim about September.
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Selftest, hermetic and live
+        run: ./ontology-term-validate-selftest.sh
+
+      - name: Prove it refuses when it cannot resolve
+        # A detector that has only ever been seen pass is indistinguishable from
+        # `exit 0`. This asserts the fail-closed path actually fires: with no
+        # network every lookup must fail, and the tool must NOT report clean.
+        run: |
+          printf 'id: "HP:0001250"\nlabel: "Seizure"\n' > /tmp/t.yaml
+          set +e
+          ./ontology-term-validate.sh --no-network /tmp/t.yaml
+          rc=$?
+          set -e
+          echo "no-network exit: ${rc}"
+          if [ "${rc}" = "0" ]; then
+            echo "FAIL: reported clean with no network available" >&2
+            exit 1
+          fi
+
+      - name: Prove it catches a planted mismatch
+        run: |
+          printf 'id: "NCIT:C5189"\nlabel: "Radical Cystoprostatectomy"\n' > /tmp/m.yaml
+          set +e
+          ./ontology-term-validate.sh /tmp/m.yaml
+          rc=$?
+          set -e
+          echo "planted-mismatch exit: ${rc}"
+          if [ "${rc}" != "1" ]; then
+            echo "FAIL: expected exit 1 on a planted mismatch, got ${rc}" >&2
+            exit 1
+          fi
+
+      - name: The shipped clean example is clean
+        # The tool checked against its own repository: a README that makes
+        # claims and a sample tree that must agree with the ontology.
+        run: ./ontology-term-validate.sh README.md examples/clean
+
+      - name: The shipped mismatch example is caught
+        run: |
+          set +e
+          ./ontology-term-validate.sh examples/mismatch
+          rc=$?
+          set -e
+          echo "examples/mismatch exit: ${rc}"
+          if [ "${rc}" != "1" ]; then
+            echo "FAIL: expected exit 1 on examples/mismatch, got ${rc}" >&2
+            exit 1
+          fi

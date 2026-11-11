@@ -1,0 +1,11 @@
+# Synthetic. Identifiers and labels only -- no records about people.
+# Every pair here agrees with the ontology, so scanning this directory exits 0.
+phenotype:
+  id: "HP:0001250"
+  label: "Seizure"
+disease:
+  id: "MONDO:0007947"
+  label: "Marfan syndrome"
+procedure:
+  id: "NCIT:C51899"
+  label: "Radical Cystoprostatectomy"

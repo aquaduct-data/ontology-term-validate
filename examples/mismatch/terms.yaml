@@ -1,0 +1,6 @@
+# Synthetic. The defect this tool exists for, planted on purpose.
+# NCIT:C5189 is a real identifier -- for Breast Extraskeletal Osteosarcoma.
+# The label belongs to NCIT:C51899. Scanning this directory exits 1.
+procedure:
+  id: "NCIT:C5189"
+  label: "Radical Cystoprostatectomy"
