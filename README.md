@@ -64,13 +64,72 @@ a scan that finds nothing wrong, so it gets its own code and its own words.
 
 ## What it reads
 
-`.java .rst .yaml .yml .json .md .txt .py .proto .kt .ts .js`
+`.java .rst .yaml .yml .json .md .txt .py .proto .kt .ts .js .rs`
 
-Four extractors: `ontologyClass("ID", "label")` calls, Java builder chains
+Six extractors: `ontologyClass("ID", "label")` calls, Java builder chains
 (`.setId(...).setLabel(...)`), `id:` / `label:` pairs in YAML and reStructuredText
 literal blocks, and JSON — which is parsed **structurally**, never by regex,
 because a Java-shaped pattern applied to JSON matches the wrong neighbouring
-string.
+string — plus two for Rust.
+
+### Rust
+
+Rust source writes terms in shapes the others cannot see, so `.rs` files get
+their own two extractors and nothing else:
+
+```rust
+HpoTermData::from_str("HP:0000574", "Thick eyebrow", "excluded")  // identifier, then label
+HpoTermDuplet::new("Delayed ability to sit", "HP:0025336")        // label, then identifier
+#[case("Y-linked inheritance", "HP:0001450")]                      // test-case attributes too
+OntologyClass { id: "SO:1000183".to_string(), label: "...".to_string() }
+ModeOfInheritance {
+    hpo_id: "HP:0000006".to_string(),        // fields sharing a stem: hpo_id / hpo_label,
+    hpo_label: "Autosomal dominant inheritance".to_string(),  // disease_id / disease_label
+}
+```
+
+Two literals count as a pair only when they are **adjacent arguments**. Text in
+a following `.expect("...")`, or in the next tuple of a list, is never borrowed.
+
+Order is decided per argument list. A flat table that alternates —
+`["HP:..", "label", "HP:..", "label"]`, or the same thing label-first — is read
+in the order its first entry sets, all the way along. Otherwise an identifier
+takes the literal after it; and if that one call has a plausible label on *both*
+sides, that occurrence passes when either is the term's label. The allowance
+belongs to that one occurrence and never excuses the same pair elsewhere.
+
+An inline struct — `Ref { id: "..", label: ".." }`, opened and closed on one
+line — keeps its fields to that line. It never takes a label from the struct
+around it, and it does not stop the outer struct finding its own.
+
+Identifiers never paired with a label **anywhere in the scan** are counted in
+the header (`unlabelled ids : N … NOT checked`), so a clean verdict is never
+mistaken for every identifier having been looked at. An identifier that is
+paired in one place and bare in another is not in that count.
+
+**Limits.** Read a Rust `MISMATCH` before acting on it, and do not read a clean
+result as proof.
+
+- Identifiers must be colon form. An underscore form would turn every
+  `NM_000138.5` into a pair.
+- A positional argument beside an identifier is *assumed* to be its label, so
+  `f("HGNC:3603", "NM_000138.5")` yields a pair that is not one, and
+  `assert_eq!(t.id, "HP:0001250", "id must round trip")` reports the assert
+  message as a mismatched label.
+- Code inside comments is read, as it is by the other extractors. A wrong pair
+  in a commented-out line is still reported.
+- Strings are found by pattern, not by a Rust lexer. Raw strings (`r"..."`,
+  `r#"..."#`) are not read, and nothing reports that they were skipped. A raw
+  string, a `'"'` char literal or the last line of a multi-line string can also
+  hide the pairs that follow it **on the same line**.
+- Braces are counted as characters when working out what is inline, so a `{` or
+  `}` inside a string literal on the same line can mislead it.
+- An identifier at the end of `f("HP:..", "label", "MONDO:..")` has no label
+  after it and is left unpaired — counted as unlabelled, not checked.
+- Not read at all: `"HP:.." => "label"` map entries, an identifier followed by a
+  method call (`"HP:..".parse().unwrap(), "label"`), a block comment between two
+  arguments, a label continued across lines with `\`, and a `label:` field more
+  than three lines from its `id:`.
 
 `.mjs` is deliberately **not** on that list. If you keep terms in an `.mjs` file
 they will not be scanned, and you will get a clean-looking exit 3.
@@ -117,7 +176,7 @@ run; if a lookup did not answer, you do not know.
 ./ontology-term-validate-selftest.sh
 ```
 
-21 cases, hermetic by default via `--offline-map`, plus live lookups when the
+35 cases, hermetic by default via `--offline-map`, plus live lookups when the
 network is available. Every classification has a case that **plants the defect
 and requires the tool to report it**, so a passing suite means the detector
 still bites.

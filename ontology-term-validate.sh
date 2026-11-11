@@ -14,7 +14,8 @@
 #   unrelated but syntactically valid identifiers are caught automatically."
 #
 # WHAT IT DOES
-#   Finds (CURIE, label) pairs in a source tree, resolves each CURIE against
+#   Finds (CURIE, label) pairs in a source tree (Java, Kotlin, Rust, YAML,
+#   reStructuredText, JSON and more), resolves each CURIE against
 #   EBI OLS4, and classifies each pair:
 #     MISMATCH   — CURIE resolves, to a DIFFERENT label than the one written
 #     UNRESOLVED — lookup failed / term not found / prefix not in OLS4
@@ -51,7 +52,7 @@ set -uo pipefail
 # SIGPIPE, and under `pipefail` a genuine match reads as a failure. This repo
 # has fixed that same bug four times. Write to a file, then scan the file.
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 usage() {
   cat >&2 <<'USAGE'
@@ -175,7 +176,7 @@ PREFIX_ONTOLOGY = {
 # Some prefixes are written one way and indexed in OLS4 under another.
 CURIE_PREFIX_ALIAS = {"SCTID": "SNOMED", "NCBITAXON": "NCBITaxon"}
 FILE_EXTS = (".java", ".rst", ".yaml", ".yml", ".json", ".md", ".txt", ".py",
-             ".proto", ".kt", ".ts", ".js")
+             ".proto", ".kt", ".ts", ".js", ".rs")
 SKIP_DIRS = {".git", "target", "build", "node_modules", ".gradle", ".idea",
              "__pycache__", ".mvn", "dist", "venv", ".venv"}
 
@@ -245,6 +246,242 @@ def extract_json(path, text, rel, out):
     return True
 
 
+# ── Rust ─────────────────────────────────────────────────────────────────────
+# Rust source writes terms in shapes none of the extractors above can see, and
+# the live phenopacket tooling is Rust. Two extractors, both deliberately narrow.
+#
+# The identifier here must be COLON form. The underscore form the other
+# extractors accept (HP_0001250) would turn every transcript accession in Rust
+# source -- "NM_000138.5" -- into a pair with an unknown prefix.
+RS_CURIE_RE = r"[A-Za-z][A-Za-z0-9]*:[A-Za-z0-9][A-Za-z0-9\.\-]*"
+# A string literal on one line. The lookbehind skips the OPENING quote of raw
+# and byte strings (r"..", r#".."#, b".."), so a term written in one is not
+# read -- and nothing reports that: the blind-spot section lists unknown
+# PREFIXES only. Worse, this is a pattern and not a lexer, so a raw string's
+# closing quote, a '"' char literal, or the last line of a multi-line string can
+# be taken as an opening quote, and pairs later ON THAT LINE are then lost
+# silently. Damage is confined to the line. A real lexer would remove this.
+RE_RS_STR = re.compile(r'(?<![A-Za-z0-9_#])"((?:[^"\\\n]|\\.)*)"')
+_RS_WRAP = r'(?:&\s*)?(?:(?:Some|String::from)\s*\(\s*)?'
+_RS_TAIL = r'(?:\s*\.\s*(?:to_string|to_owned|into)\(\s*\))?\s*\)?'
+# What may sit between two literals for them to count as ADJACENT ARGUMENTS:
+# an optional .to_string(), an optional closing paren of Some(..), one comma,
+# an optional Some( / String::from( / & opener. Nothing else -- not a field
+# name, not `).expect(`, not the `), (` between two tuples. That last one is
+# what stops a label being borrowed from the neighbouring tuple.
+RE_RS_BETWEEN = re.compile(_RS_TAIL + r'\s*,\s*' + _RS_WRAP + r'\Z')
+RE_RS_FIELD_ID = re.compile(
+    r'(?<![A-Za-z0-9_])([A-Za-z0-9_]*?)_?id\s*:\s*' + _RS_WRAP + r'"(' + RS_CURIE_RE + r')"')
+
+def _rs_label_ok(s):
+    s = s.strip()
+    return (0 < len(s) <= 200 and re.search(r"[A-Za-z]", s) is not None
+            and not re.fullmatch(RS_CURIE_RE, s) and s not in ("label", "id", "type"))
+
+
+def _rs_inline_span(line, pos):
+    """(open, close) of the innermost { .. } around `pos` that both opens and
+    closes on this line, or None. Braces are counted as characters, so a brace
+    inside a string literal can mislead it; that is a stated limit."""
+    depth, start = 0, None
+    for i in range(pos, -1, -1):
+        ch = line[i]
+        if ch == "}":
+            depth += 1
+        elif ch == "{":
+            if depth == 0:
+                start = i
+                break
+            depth -= 1
+    if start is None:
+        return None
+    depth = 0
+    for j in range(pos, len(line)):
+        ch = line[j]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            if depth == 0:
+                return (start, j)
+            depth -= 1
+    return None
+
+
+def _rs_blank_inline(s):
+    """`s` with every balanced { .. } on the line replaced by spaces."""
+    out, stack = list(s), []
+    for i, ch in enumerate(s):
+        if ch == "{":
+            stack.append(i)
+        elif ch == "}" and stack:
+            a = stack.pop()
+            if not stack:
+                for k in range(a, i + 1):
+                    out[k] = " "
+    return "".join(out)
+
+
+# Rust identifiers with a resolvable prefix: every one seen, and every one that
+# was paired with a label somewhere in the scan. The difference is printed as
+# NOT checked, so a clean verdict is never read as "every identifier was looked
+# at". Sets, across the whole scan -- a per-file sum counted the same
+# identifier once per file and still called the total "distinct".
+RS_SEEN, RS_PAIRED = set(), set()
+
+
+def _rs_unescape(s):
+    return s.replace('\\"', '"').replace("\\\\", "\\")
+
+
+def extract_rust(text, rel, out):
+    """Two shapes, measured on real Rust phenopacket tooling rather than guessed.
+
+    1. Adjacent string-literal arguments, in EITHER order:
+           HpoTermData::from_str("HP:0000574", "Thick eyebrow", "excluded")
+           HpoTermDuplet::new("Delayed ability to sit", "HP:0025336")
+           ("HP:0000006", "Autosomal dominant inheritance"),
+           #[case("Y-linked inheritance", "HP:0001450")]
+       The literal AFTER the identifier is preferred, matching every other
+       extractor here. When there are plausible labels on both sides the order
+       is genuinely ambiguous, so the pair passes if EITHER is the term's label
+       and is reported against the following one otherwise.
+    2. Struct fields sharing a stem: `hpo_id:` with `hpo_label:`, `disease_id:`
+       with `disease_label:`, bare `id:` with `label:` -- on the same line, or
+       within three lines at the same indentation.
+    """
+    first_new = len(out)
+    starts = [0]
+    for m in re.finditer(r"\n", text):
+        starts.append(m.end())
+
+    def lineno(off):
+        lo, hi = 0, len(starts) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if starts[mid] <= off:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo + 1
+
+    toks = [(m.start(), m.end(), _rs_unescape(m.group(1))) for m in RE_RS_STR.finditer(text)]
+
+    def adjacent(i, j):
+        return RE_RS_BETWEEN.match(text[toks[i][1]:toks[j][0]]) is not None
+
+    # A CHAIN is a maximal run of adjacent literals: one argument list, one
+    # tuple, one flat array. Order is decided per chain, never per file.
+    chains, cur = [], []
+    for i in range(len(toks)):
+        if cur and not adjacent(cur[-1], i):
+            chains.append(cur); cur = []
+        cur.append(i)
+    if cur:
+        chains.append(cur)
+
+    for chain in chains:
+        vals = [toks[i][2] for i in chain]
+        is_id = [re.fullmatch(RS_CURIE_RE, v) is not None for v in vals]
+        if not any(is_id):
+            continue
+        n = len(chain)
+        alternating = n % 2 == 0 and all(is_id[k] != is_id[k + 1] for k in range(n - 1))
+        if alternating:
+            # A table. The first literal decides the order for ALL of it:
+            #   ["HP:1", "Seizure", "HP:1", "Marfan syndrome"]   identifier first
+            #   ["Seizure", "HP:1", "Marfan syndrome", "MONDO:2"] label first
+            # Without this, the second identifier of the first table would find
+            # "Seizure" on its other side and be excused -- a real mismatch
+            # reported clean. Found in independent review before release.
+            off = 0 if is_id[0] else 1
+            for k in range(0, n, 2):
+                idv, lab = vals[k + off], vals[k + 1 - off]
+                if _rs_label_ok(lab):
+                    out.append((idv, lab.strip(), rel, lineno(toks[chain[k + off]][0]), None))
+            continue
+        # Not a table: each identifier takes the literal AFTER it. A literal
+        # already taken that way is never offered again as someone's "other side".
+        taken = set()
+        for k in range(n):
+            if is_id[k] and k + 1 < n and not is_id[k + 1] and _rs_label_ok(vals[k + 1]):
+                taken.add(k + 1)
+        for k in range(n):
+            if not is_id[k]:
+                continue
+            nxt = vals[k + 1].strip() if (k + 1) in taken else None
+            prv = (vals[k - 1].strip() if k > 0 and not is_id[k - 1] and (k - 1) not in taken
+                   and _rs_label_ok(vals[k - 1]) else None)
+            line_no = lineno(toks[chain[k]][0])
+            if nxt is not None:
+                # `prv` rides on THIS occurrence only. It used to be stored per
+                # (identifier, label, file), which let one ambiguous call excuse
+                # an unambiguous mismatch elsewhere in the same file.
+                out.append((vals[k], nxt, rel, line_no, prv))
+            elif prv is not None:
+                out.append((vals[k], prv, rel, line_no, None))
+
+    lines = text.splitlines()
+    for idx, line in enumerate(lines):
+        for m in RE_RS_FIELD_ID.finditer(line):
+            stem, curie = m.group(1), m.group(2)
+            pat = re.escape(stem) + (r'_?' if stem else r'')
+            rx = re.compile(r'(?<![A-Za-z0-9_])' + pat + r'label\s*:\s*' + _RS_WRAP
+                            + r'"((?:[^"\\]|\\.)*)"')
+            rx_lead_id = re.compile(r'(?:pub\s+)?' + pat + r'id\s*:')
+
+            def label_in(s):
+                ml = rx.search(s)
+                if ml and _rs_label_ok(_rs_unescape(ml.group(1))):
+                    return _rs_unescape(ml.group(1)).strip()
+                return None
+
+            found = None
+            span = _rs_inline_span(line, m.start())
+            if span is not None:
+                # An inline struct -- `Ref { id: "..", label: ".." }`, opened and
+                # closed on this line -- keeps its fields to itself. It never
+                # looks at another line, and structs nested inside it are
+                # blanked so their labels are not read as its own.
+                inner = line[span[0] + 1:span[1]]
+                found = label_in(_rs_blank_inline(inner))
+            else:
+                found = label_in(_rs_blank_inline(line))
+                if found is None:
+                    ind = len(line) - len(line.lstrip())
+                    for direction in (1, -1):
+                        for step in range(1, 4):
+                            j = idx + direction * step
+                            if not (0 <= j < len(lines)):
+                                break
+                            cand = lines[j]
+                            if not cand.strip():
+                                continue
+                            if len(cand) - len(cand.lstrip()) != ind:
+                                break
+                            # Inline structs on a neighbouring line are blanked
+                            # first: neither their label nor their id is ours.
+                            flat = _rs_blank_inline(cand)
+                            # A line that LEADS with an id of the same stem is a
+                            # sibling and owns what follows. An id nested inside
+                            # an inline struct further along the line is not a
+                            # sibling -- stopping there dropped the outer pair
+                            # and let the nested id take the outer label, a real
+                            # mismatch reported clean. Found in review too.
+                            if rx_lead_id.match(flat.lstrip()):
+                                break
+                            found = label_in(flat)
+                            if found:
+                                break
+                        if found:
+                            break
+            if found:
+                out.append((curie, found, rel, idx + 1, None))
+
+    RS_PAIRED.update(row[0] for row in out[first_new:])
+    RS_SEEN.update(v for _, _, v in toks
+                   if re.fullmatch(RS_CURIE_RE, v) and v.split(":", 1)[0].upper() in PREFIX_ONTOLOGY)
+
+
 def extract(files):
     pairs = []          # (curie, label, relpath, lineno)
     id_tokens = set()   # every CURIE-shaped token seen, for the blind-spot count
@@ -261,6 +498,11 @@ def extract(files):
             id_tokens.add(m.group(1).replace("_", ":"))
 
         if path.endswith(".json") and extract_json(path, text, rel, pairs):
+            continue
+        if path.endswith(".rs"):
+            # Rust gets ONLY the Rust extractors. The Java-shaped patterns below
+            # accept underscore identifiers, which in Rust source are accessions.
+            extract_rust(text, rel, pairs)
             continue
 
         lines = text.splitlines()
@@ -318,13 +560,18 @@ def extract(files):
     # Dedup per (CURIE, label, FILE) — NOT per (CURIE, label). The same wrong
     # pair appearing in four files is four sites to fix, and issue #451 names
     # four affected locations; collapsing them to one would hide three of them.
+    # A fifth field, used by the Rust extractor only: the literal on the OTHER
+    # side of an identifier whose order is ambiguous. It is part of the key, so
+    # an ambiguous occurrence and an unambiguous one never merge.
     dedup = {}
-    for c, l, f, n in pairs:
-        key = (c, l, f)
+    for row in pairs:
+        c, l, f, n = row[:4]
+        alt = row[4] if len(row) > 4 else None
+        key = (c, l, f, alt)
         prev = dedup.get(key)
         if prev is None or (prev[3] == 0 and n > 0):
-            dedup[key] = (c, l, f, n)
-    return sorted(dedup.values()), id_tokens, read
+            dedup[key] = (c, l, f, n, alt)
+    return sorted(dedup.values(), key=lambda r: (r[0], r[1], r[2], r[3], r[4] or "")), id_tokens, read
 
 
 # ── resolution ───────────────────────────────────────────────────────────────
@@ -430,6 +677,10 @@ print("files read     : %d" % files_read)
 print("pairs found    : %d" % len(pairs))
 print("distinct CURIEs: %d" % len({p[0] for p in pairs}))
 print("resolver       : %s" % src)
+_unl = len(RS_SEEN - RS_PAIRED)
+if _unl:
+    print("unlabelled ids : %d distinct Rust identifier%s with no label beside %s — NOT checked"
+          % (_unl, "" if _unl == 1 else "s", "it" if _unl == 1 else "them"))
 print("")
 
 if not pairs:
@@ -446,17 +697,25 @@ if not pairs:
     sys.exit(EXIT_EMPTY)
 
 rows = []
-for curie, label, rel, lineno in pairs:
+for curie, label, rel, lineno, alt in pairs:
     status, cur, syns, detail = resolve(curie)
-    if status == "UNRESOLVED":
-        verdict, note = "UNRESOLVED", detail
-    elif norm(cur) == norm(label):
-        verdict = "OBSOLETE" if status == "OBSOLETE" else "OK"
-        note = detail
-    elif any(norm(s) == norm(label) for s in syns):
-        verdict, note = "SYNONYM", "exact synonym of %r" % cur
-    else:
-        verdict, note = "MISMATCH", detail
+
+    def judge(written):
+        if status == "UNRESOLVED":
+            return "UNRESOLVED", detail
+        if norm(cur) == norm(written):
+            return ("OBSOLETE" if status == "OBSOLETE" else "OK"), detail
+        if any(norm(s) == norm(written) for s in syns):
+            return "SYNONYM", "exact synonym of %r" % cur
+        return "MISMATCH", detail
+
+    verdict, note = judge(label)
+    if verdict == "MISMATCH" and alt is not None:
+        # A label sat on BOTH sides of THIS occurrence. Order is not knowable
+        # from syntax, so it passes if either one is the term's label.
+        v2, n2 = judge(alt)
+        if v2 != "MISMATCH":
+            label, verdict, note = alt, v2, n2
     rows.append({"curie": curie, "written": label, "ontology": cur,
                  "verdict": verdict, "note": note, "file": rel, "line": lineno})
 

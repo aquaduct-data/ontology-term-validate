@@ -229,6 +229,200 @@ if [ $rc -eq 0 ] && has "${WORK}/out" "VERDICT OK" && has "${WORK}/report.json" 
   ok "--json <writable> -> exit 0, report written and agrees with VERDICT (control)"
 else bad "--json <writable> should write a report agreeing with exit 0 (got exit ${rc})" "${WORK}/out"; fi
 
+# ── Rust ─────────────────────────────────────────────────────────────────────
+# Shapes taken from real Rust phenopacket tooling, not invented. Every negative
+# below is a pair the extractor must NOT make, written so that making it would
+# change the verdict -- a control that cannot fail is not a control.
+mkdir -p "${WORK}/rs_good" "${WORK}/rs_labelfirst" "${WORK}/rs_field" "${WORK}/rs_ambig_ok" \
+         "${WORK}/rs_ambig_bad" "${WORK}/rs_accession" "${WORK}/rs_boundary"
+
+cat > "${WORK}/rs_good/good.rs" <<'R'
+fn fixtures() {
+    let a = HpoTermData::from_str("HP:0001250", "Seizure", "observed").unwrap();
+    let b = HpoTermDuplet::new("Marfan syndrome","MONDO:0007947" );
+    // The .expect() text is NOT an argument next to the identifier. If it were
+    // paired, this line alone would turn the verdict to MISMATCH.
+    let c = find(&children, "NCIT:C51899").expect("Breast Extraskeletal Osteosarcoma");
+    let d = vec![("NCIT:C51899", "Radical Cystoprostatectomy"),
+        ("HP:0001250", "Seizure")];
+    let e = Moi { hpo_id: "HP:0001250".to_string(), hpo_label: "Seizure".to_string() };
+    let f = DiseaseData {
+        disease_id: "MONDO:0007947".to_string(),
+        disease_label: "Marfan syndrome".to_string(),
+    };
+    let g = HpoTermDuplet::new(
+        "Seizure",
+        "HP:0001250",
+    );
+}
+R
+cat > "${WORK}/rs_labelfirst/bad.rs" <<'R'
+fn f() { let d = HpoTermDuplet::new("Radical Cystoprostatectomy", "NCIT:C5189"); }
+R
+cat > "${WORK}/rs_field/bad.rs" <<'R'
+fn f() -> OntologyClass {
+    OntologyClass {
+        id: "NCIT:C5189".to_string(),
+        label: "Radical Cystoprostatectomy".to_string(),
+    }
+}
+R
+cat > "${WORK}/rs_ambig_ok/a.rs" <<'R'
+fn f() { let x = row("Seizure", "HP:0001250", "observed"); }
+R
+cat > "${WORK}/rs_ambig_bad/a.rs" <<'R'
+fn f() { let x = row("Marfan syndrome", "HP:0001250", "observed"); }
+R
+cat > "${WORK}/rs_accession/a.rs" <<'R'
+fn f() { let v = VariantDto::hgvs_c("c.8242G>T", "NM_000138.5"); }
+R
+cat > "${WORK}/rs_boundary/a.rs" <<'R'
+fn f() { let v = vec![
+        ("Marfan syndrome", "HP:0001250"),
+        ("Seizure", "MONDO:0007947")]; }
+R
+
+echo ""
+echo "── RUST CASES (offline map) ─────────────────────────────────────────────"
+
+# R1 — every Rust shape is read, and the .expect() decoy is not paired
+run_tool --offline-map "${MAP}" "${WORK}/rs_good"; rc=$?
+if [ $rc -eq 0 ] && has "${WORK}/out" "pairs=3" && has "${WORK}/out" "mismatch=0"; then
+  ok "rust: all shapes read (3 distinct pairs), .expect() text not paired -> exit 0"
+else bad "rust good fixture should exit 0 with pairs=3 (got exit ${rc})" "${WORK}/out"; fi
+
+# R2 — label-first argument order: the planted #451 pair is caught
+run_tool --offline-map "${MAP}" "${WORK}/rs_labelfirst"; rc=$?
+if [ $rc -eq 1 ] && has "${WORK}/out" "NCIT:C5189  written='Radical Cystoprostatectomy'  ontology='Breast Extraskeletal Osteosarcoma'"; then
+  ok "rust: label-first arguments, planted mismatch -> exit 1"
+else bad "rust label-first mismatch should exit 1 (got exit ${rc})" "${WORK}/out"; fi
+
+# R3 — struct fields: id / label across lines, planted mismatch, with its line
+run_tool --offline-map "${MAP}" "${WORK}/rs_field"; rc=$?
+if [ $rc -eq 1 ] && has "${WORK}/out" "mismatch=1" && has "${WORK}/out" "at bad.rs:3"; then
+  ok "rust: struct fields, planted mismatch -> exit 1 at the id line"
+else bad "rust struct-field mismatch should exit 1 at bad.rs:3 (got exit ${rc})" "${WORK}/out"; fi
+
+# R4 — a label on both sides: passes when EITHER is the term's label
+run_tool --offline-map "${MAP}" "${WORK}/rs_ambig_ok"; rc=$?
+if [ $rc -eq 0 ] && has "${WORK}/out" "ok=1" && has "${WORK}/out" "mismatch=0"; then
+  ok "rust: label on both sides, preceding one is right -> OK, not a false MISMATCH"
+else bad "rust ambiguous-order pair should pass on the preceding label (got exit ${rc})" "${WORK}/out"; fi
+
+# R5 — ...and still bites when NEITHER is
+run_tool --offline-map "${MAP}" "${WORK}/rs_ambig_bad"; rc=$?
+if [ $rc -eq 1 ] && has "${WORK}/out" "mismatch=1"; then
+  ok "rust: label on both sides, neither is right -> MISMATCH (exit 1)"
+else bad "rust ambiguous-order pair with no right label should exit 1 (got exit ${rc})" "${WORK}/out"; fi
+
+# R6 — a transcript accession is not an identifier: nothing to check, exit 3
+run_tool --offline-map "${MAP}" "${WORK}/rs_accession"; rc=$?
+if [ $rc -eq 3 ] && has "${WORK}/out" "EMPTY SCAN"; then
+  ok "rust: NM_ accession is not read as an identifier -> exit 3, EMPTY SCAN"
+else bad "rust accession-only file should be an empty scan (got exit ${rc})" "${WORK}/out"; fi
+
+# R7 — a label is never borrowed from the neighbouring tuple. Borrowing would
+#      pair each identifier with the OTHER tuple's label, which happens to be
+#      correct, and report clean.
+run_tool --offline-map "${MAP}" "${WORK}/rs_boundary"; rc=$?
+if [ $rc -eq 1 ] && has "${WORK}/out" "mismatch=2"; then
+  ok "rust: tuple boundary respected -> both swapped labels reported (mismatch=2)"
+else bad "rust tuple-boundary fixture should report mismatch=2 (got exit ${rc})" "${WORK}/out"; fi
+
+# R8-R11 -- from the independent review of the first Rust extractor. R8 and R9
+# are its two reproductions of a real mismatch reported clean; both were exit 0
+# before the fix. R10 and R11 are controls that the fix is not simply stricter.
+mkdir -p "${WORK}/rs_m1_shared" "${WORK}/rs_m1_table" "${WORK}/rs_table_labelfirst" "${WORK}/rs_sibling"
+cat > "${WORK}/rs_m1_shared/a.rs" <<'R'
+fn f() {
+    let a = row("Seizure", "HP:0001250", "Marfan syndrome");
+}
+fn g() {
+    let b = pair("HP:0001250", "Marfan syndrome");
+}
+R
+cat > "${WORK}/rs_m1_table/a.rs" <<'R'
+const TERMS: [&str; 4] = ["HP:0001250", "Seizure", "HP:0001250", "Marfan syndrome"];
+R
+cat > "${WORK}/rs_table_labelfirst/a.rs" <<'R'
+const TERMS: [&str; 4] = ["Seizure", "HP:0001250", "Marfan syndrome", "MONDO:0007947"];
+R
+cat > "${WORK}/rs_sibling/a.rs" <<'R'
+fn f() -> Vec<T> {
+    vec![
+        T { id: "MONDO:0007947", label: "Marfan syndrome" },
+        T { id: "HP:0001250", name: "x" },
+    ]
+}
+R
+
+# R8 — an ambiguous call must not excuse an unambiguous mismatch in the same file
+run_tool --offline-map "${MAP}" "${WORK}/rs_m1_shared"; rc=$?
+if [ $rc -eq 1 ] && has "${WORK}/out" "mismatch=1" && has "${WORK}/out" "ok=1" && has "${WORK}/out" "at a.rs:5"; then
+  ok "rust: ambiguity is per occurrence -> the plain mismatch at line 5 is still reported"
+else bad "rust: one ambiguous call excused a real mismatch elsewhere (got exit ${rc})" "${WORK}/out"; fi
+
+# R9 — a flat identifier-first table: a copy-pasted identifier is caught
+run_tool --offline-map "${MAP}" "${WORK}/rs_m1_table"; rc=$?
+if [ $rc -eq 1 ] && has "${WORK}/out" "mismatch=1" && has "${WORK}/out" "written='Marfan syndrome'"; then
+  ok "rust: flat identifier-first table, repeated identifier -> MISMATCH (exit 1)"
+else bad "rust: flat table with a repeated identifier should exit 1 (got exit ${rc})" "${WORK}/out"; fi
+
+# R10 — control: the same table written label-first is entirely correct
+run_tool --offline-map "${MAP}" "${WORK}/rs_table_labelfirst"; rc=$?
+if [ $rc -eq 0 ] && has "${WORK}/out" "ok=2" && has "${WORK}/out" "pairs=2"; then
+  ok "rust: flat label-first table -> both pairs read and OK (control)"
+else bad "rust: flat label-first table should be ok=2 pairs=2 (got exit ${rc})" "${WORK}/out"; fi
+
+# R11 — a struct with no label does not borrow its sibling's
+run_tool --offline-map "${MAP}" "${WORK}/rs_sibling"; rc=$?
+if [ $rc -eq 0 ] && has "${WORK}/out" "pairs=1" && has "${WORK}/out" "mismatch=0"; then
+  ok "rust: sibling struct's label is not borrowed -> pairs=1, no false MISMATCH"
+else bad "rust: a label was borrowed from a sibling struct (got exit ${rc})" "${WORK}/out"; fi
+
+# R12-R14 -- from the second review. R12 is a false OK that the R11 fix itself
+# introduced; R13 is its control; R14 makes a silent skip visible.
+mkdir -p "${WORK}/rs_nested_bad" "${WORK}/rs_nested_ok" "${WORK}/rs_trailing"
+cat > "${WORK}/rs_nested_bad/a.rs" <<'R'
+fn f() -> Term {
+    Term {
+        id: "HP:0001250",
+        parent: Ref { id: "MONDO:0007947" },
+        label: "Marfan syndrome",
+    }
+}
+R
+cat > "${WORK}/rs_nested_ok/a.rs" <<'R'
+fn f() -> Term {
+    Term {
+        id: "HP:0001250",
+        parent: Ref { id: "MONDO:0007947" },
+        label: "Seizure",
+    }
+}
+R
+cat > "${WORK}/rs_trailing/a.rs" <<'R'
+fn f() { let x = alias("HP:0001250", "Seizure", "MONDO:0007947"); }
+R
+
+# R12 — a nested inline id neither stops the outer scan nor takes the outer label
+run_tool --offline-map "${MAP}" "${WORK}/rs_nested_bad"; rc=$?
+if [ $rc -eq 1 ] && has "${WORK}/out" "HP:0001250  written='Marfan syndrome'  ontology='Seizure'" && has "${WORK}/out" "pairs=1"; then
+  ok "rust: nested inline struct between id and label -> the outer mismatch is reported"
+else bad "rust: a nested inline id hid the outer mismatch (got exit ${rc})" "${WORK}/out"; fi
+
+# R13 — control: with the right outer label the same shape is one clean pair
+run_tool --offline-map "${MAP}" "${WORK}/rs_nested_ok"; rc=$?
+if [ $rc -eq 0 ] && has "${WORK}/out" "ok=1" && has "${WORK}/out" "pairs=1"; then
+  ok "rust: nested inline struct, outer label right -> ok=1 pairs=1 (control)"
+else bad "rust: nested inline struct with a right label should be ok=1 pairs=1 (got exit ${rc})" "${WORK}/out"; fi
+
+# R14 — an identifier left without a label is counted out loud, never just dropped
+run_tool --offline-map "${MAP}" "${WORK}/rs_trailing"; rc=$?
+if [ $rc -eq 0 ] && has "${WORK}/out" "unlabelled ids : 1 distinct Rust identifier with no label beside it"; then
+  ok "rust: trailing identifier with no label -> reported as unlabelled, not silently skipped"
+else bad "rust: an unpaired identifier should be counted in the header (got exit ${rc})" "${WORK}/out"; fi
+
 # ── network cases ────────────────────────────────────────────────────────────
 echo ""
 echo "── NETWORK CASES (live EBI OLS4) ────────────────────────────────────────"
