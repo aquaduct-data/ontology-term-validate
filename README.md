@@ -113,7 +113,8 @@ result as proof.
 - Identifiers must be colon form. An underscore form would turn every
   `NM_000138.5` into a pair.
 - A positional argument beside an identifier is *assumed* to be its label, so
-  `f("HGNC:3603", "NM_000138.5")` yields a pair that is not one, and
+  a call that passes a gene identifier and then a transcript accession yields a
+  pair that is not one, and
   `assert_eq!(t.id, "HP:0001250", "id must round trip")` reports the assert
   message as a mismatched label.
 - Code inside comments is read, as it is by the other extractors. A wrong pair
