@@ -208,6 +208,37 @@ any case when a digit follows (`hp:0001250`).
   not counted, and one with an escape later is counted only up to the escape.
   Neither gives a pair.
 
+## Text that is not a name is set aside
+
+Two strings side by side are not always an identifier and its name. In test
+code especially, the second is often another identifier, a number or a field
+name: `("CL:0000127", "cell_type")`, `("HP:0001166", "HP:0040064")`,
+`("CHEBI:1", "0.35")`. None of these can be a *wrong* name, because none is a
+name, so they are not reported as mismatches. They are **set aside, counted
+in the header (`not a label`) and listed in the JSON report with the reason**:
+(In Rust the reader does not pair an identifier with a number, or with another
+identifier written with a colon, in the first place; those show up under
+`unlabelled ids` instead.)
+
+- another identifier (colon form, or `PREFIX_digits` with a prefix this tool
+  knows)
+- no letter in it at all
+- the identifier itself written again, whatever the punctuation
+- the bare name of an ontology (`NCBITAXON`)
+- a lower-case `word_with_underscores`, **but only when the term resolves and
+  neither its label nor a synonym is written that way**. Sequence Ontology
+  names (`missense_variant`) and the Gene Ontology roots are written with
+  underscores, so those are judged like any other name. If the identifier
+  cannot be looked up, the pair stays `UNRESOLVED`.
+
+A single plain word is **still judged**: `"tissue"` beside the identifier for
+lung is reported, because it may be a wrong name. That means test code can
+still produce false mismatches from words such as `name` or `object`. Read a
+mismatch in a test file before acting on it.
+
+Measured on twelve public projects: 72 mismatches reported before this rule,
+22 after, and every one of the 15 real ones kept.
+
 ## Options
 
 ```
@@ -250,7 +281,7 @@ run; if a lookup did not answer, you do not know.
 ./ontology-term-validate-selftest.sh
 ```
 
-114 cases, hermetic by default via `--offline-map`, plus live lookups when the
+129 cases, hermetic by default via `--offline-map`, plus live lookups when the
 network is available. Every classification has a case that **plants the defect
 and requires the tool to report it**, so a passing suite means the detector
 still bites.

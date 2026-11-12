@@ -119,6 +119,8 @@ NCIT:C51899	Radical Cystoprostatectomy	Cystoprostatectomy|Radical Cystoprostatec
 NCIT:C5189	Breast Extraskeletal Osteosarcoma	Breast Osteosarcoma
 MONDO:0007947	Marfan syndrome	MFS
 NCIT:C99999999	__NOTFOUND__
+SO:0001583	missense_variant
+GO:0008150	biological_process
 M
 
 # Report the tool path repo-relative: committed transcripts must carry no host paths.
@@ -1262,6 +1264,94 @@ PYE
   if [ "${verdict}" = "OK" ]; then ok "account: ${d} -> every identifier a grep finds is counted, ${want_paired} paired, the rest printed"
   else bad "account: ${d} ${verdict}" "${WORK}/out"; fi
 done
+
+# ── not a label ──────────────────────────────────────────────────────────────
+# Measured on twelve real projects: 50 of 72 reported mismatches were two
+# strings side by side in test code where the second was never a name.
+for d in nl_ids nl_num nl_snake nl_again nl_word nl_mixed nl_rust nl_so_ok nl_so_bad nl_go_bad nl_judged nl_prefix nl_unres; do mkdir -p "${WORK}/${d}"; done
+cat > "${WORK}/nl_ids/t.py" <<'T'
+pairs = [("NCIT:C5189", "HP:0001250"), ("NCIT:C5189", "MONDO_0007947")]
+T
+cat > "${WORK}/nl_num/t.py" <<'T'
+scores = [("NCIT:C5189", "0.35"), ("NCIT:C5189", "42")]
+T
+cat > "${WORK}/nl_snake/t.py" <<'T'
+edges = [("NCIT:C5189", "is_marker_for"), ("NCIT:C5189", "cell_type")]
+T
+cat > "${WORK}/nl_again/t.py" <<'T'
+same = [("NCIT:C5189", "NCIT C5189"), ("NCIT:C5189", "C5189")]
+T
+# One plain word IS judged: it may be a wrong name, and that is the tool's whole job.
+cat > "${WORK}/nl_word/t.py" <<'T'
+x = ontologyClass("NCIT:C5189", "tissue")
+T
+# A right pair and a wrong pair beside three that are not labels: both still judged.
+cat > "${WORK}/nl_mixed/t.py" <<'T'
+a = [("HP:0001250", "Seizure"), ("NCIT:C5189", "Radical Cystoprostatectomy"),
+     ("HP:0001250", "HP:0001250"), ("HP:0001250", "has_phenotype"), ("HP:0001250", "1250")]
+T
+# Rust: a label on both sides, one of them an identifier -> the other one is judged.
+cat > "${WORK}/nl_rust/a.rs" <<'R'
+fn f() { let a = T::new("Radical Cystoprostatectomy", "NCIT:C5189", "is_marker_for"); }
+fn g() { let b = T::new("has_phenotype", "NCIT:C5189", "Radical Cystoprostatectomy"); }
+R
+# Found in review: Sequence Ontology names and the Gene Ontology roots ARE written
+# with underscores. The ontology decides, not the spelling.
+cat > "${WORK}/nl_so_ok/t.py" <<'T'
+v = [("SO:0001583", "missense_variant"), ("GO:0008150", "biological_process")]
+T
+cat > "${WORK}/nl_so_bad/t.py" <<'T'
+v = [("SO:0001583", "synonymous_variant")]
+T
+cat > "${WORK}/nl_go_bad/t.py" <<'T'
+v = [("GO:0008150", "molecular_function")]
+T
+# Each of these is judged, and wrong: capitals with underscores, a phrase that
+# starts with a code name, a non-ASCII letter, the local number inside a phrase,
+# a word_number whose prefix is not an ontology's.
+cat > "${WORK}/nl_judged/t.py" <<'T'
+v = [("NCIT:C5189", "SEIZURE_DISORDER_TYPE"), ("NCIT:C5189", "cell_type of neuron"), ("NCIT:C5189", "δ"),
+     ("NCIT:C5189", "Tumour type C5189 variant"), ("NCIT:C5189", "Grade_3")]
+T
+cat > "${WORK}/nl_prefix/t.py" <<'T'
+v = [("NCIT:C5189", "NCIT"), ("NCIT:C5189", "ncbitaxon")]
+T
+# An identifier that cannot be looked up keeps its snake_case partner as UNRESOLVED:
+# setting it aside would turn "cannot determine" into "nothing to see".
+cat > "${WORK}/nl_unres/t.py" <<'T'
+v = [("NCIT:C99999999", "is_marker_for")]
+T
+expect 0 nl_so_ok  "not a label: missense_variant and biological_process are real names and are judged right" "ok=2" '!not a label'
+expect 1 nl_so_bad "not a label: a wrong Sequence Ontology name is a MISMATCH, not set aside" "mismatch=1" '!not a label'
+expect 1 nl_go_bad "not a label: a wrong Gene Ontology root is a MISMATCH, not set aside" "mismatch=1" '!not a label'
+expect 1 nl_judged "not a label: capitals, phrases, non-ASCII letters and unknown word_number forms are all judged" "mismatch=5" '!not a label'
+expect 3 nl_prefix "not a label: the bare name of an ontology is set aside" "not a label    : 2 pairs" "an ontology's name"
+expect 4 nl_unres  "not a label: a code name beside an identifier that cannot be looked up stays UNRESOLVED" "unresolved=1" '!not a label'
+expect 3 nl_ids   "not a label: another identifier beside an identifier is set aside, not a mismatch" "not a label    : 2 pairs" "another identifier" "EMPTY SCAN"
+expect 3 nl_num   "not a label: a number is set aside" "not a label    : 2 pairs" "no letters"
+expect 3 nl_snake "not a label: a field or relation name is set aside" "not a label    : 2 pairs"
+expect 3 nl_again "not a label: the identifier written again is set aside" "not a label    : 2 pairs" "the identifier again"
+expect 1 nl_word  "not a label: one plain word is still judged, and reported when wrong" "mismatch=1" '!not a label'
+expect 1 nl_mixed "not a label: real pairs beside set-aside ones are still judged, and every reason is named" "ok=1" "mismatch=1" "not a label    : 3 pairs" "a code name" "no letters" "another identifier"
+expect 1 nl_rust  "not a label: with a candidate on both sides, the one that is a name is judged, whichever side it is on" "mismatch=2" "written='Radical Cystoprostatectomy'" '!not a label'
+"${TOOL}" --offline-map "${MAP}" --json "${WORK}/nl.json" "${WORK}/nl_mixed" > /dev/null 2>&1
+if python3 - "${WORK}/nl.json" <<'PYE'
+import json, sys
+j = json.load(open(sys.argv[1]))
+l = j["not_a_label_pairs"]
+sys.exit(0 if j["counts"]["not_a_label"] == len(l) == 3 and all(x["file"] and x["line"] and x["why"] for x in l) else 1)
+PYE
+then ok "not a label: the JSON lists every pair set aside, with file, line and why"
+else bad "not a label: JSON does not list the set-aside pairs"; fi
+"${TOOL}" --offline-map "${MAP}" --json "${WORK}/nl.json" "${WORK}/nl_ids" > "${WORK}/out" 2>&1
+if python3 - "${WORK}/nl.json" <<'PYE' && has "${WORK}/out" "2 set aside as not a label"
+import json, sys
+j = json.load(open(sys.argv[1]))
+l = j["not_a_label_pairs"]
+sys.exit(0 if j["verdict"] == "EMPTY-SCAN" and j["counts"]["not_a_label"] == len(l) == 2 and all(x["why"] for x in l) else 1)
+PYE
+then ok "not a label: an empty scan still says how many were set aside, and the JSON says why"
+else bad "not a label: the empty-scan report lost the set-aside pairs" "${WORK}/out"; fi
 
 # ── network cases ────────────────────────────────────────────────────────────
 echo ""

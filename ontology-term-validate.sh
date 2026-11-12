@@ -52,7 +52,7 @@ set -uo pipefail
 # SIGPIPE, and under `pipefail` a genuine match reads as a failure. That bug
 # has been made and fixed more than once. Write to a file, then scan the file.
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 
 usage() {
   cat >&2 <<'USAGE'
@@ -1373,9 +1373,68 @@ def _not_id_shape(curie):
             and pre == pre.lower())
 
 
+# NOT A LABEL. Measured on twelve real projects: of 72 mismatches reported, 49
+# were two strings side by side in test code where the second was never a
+# name: ("CL:0000127", "cell_type"), ("HP:0001166", "HP:0040064"),
+# ("CHEBI:6801", "MONDO:0005148"), ("CHEBI:1", "0.35"), or the identifier
+# written again as its own label. None of these can be a wrong name, because
+# none is a name. They are set aside, counted and listed.
+#   - another identifier: colon form, or PREFIX_digits with a prefix this tool knows
+#   - no letter in it at all
+#   - the identifier itself again, whatever the punctuation
+#   - the bare name of an ontology ("NCBITAXON")
+#   - a lower-case word_with_underscores, BUT ONLY when the identifier resolves
+#     and its own label is not written that way. Sequence Ontology names are
+#     all of that form (missense_variant), and so are the three Gene Ontology
+#     roots. A first version set every such word aside and hid a wrong SO name;
+#     review caught it. Now the ontology decides: if the term's label or a
+#     synonym is itself word_with_underscores, the pair is judged.
+# A single plain word ("tissue" beside the id for lung) is NOT set aside: it
+# may be a wrong name, and that is the thing this tool is for.
+_NOT_LABEL = []
+_SNAKE = re.compile(r"[a-z0-9]+(?:_[a-z0-9]+)+\Z")
+_ID_COLON = re.compile(RS_CURIE_RE + r"\Z")
+_ID_UNDER = re.compile(r"([A-Za-z]+)_[A-Za-z0-9]*\d[A-Za-z0-9]*\Z")
+_KNOWN_SPELLED = set(PREFIX_ONTOLOGY) | set(CURIE_PREFIX_ALIAS.values())
+_KNOWN_UPPER = {x.upper() for x in _KNOWN_SPELLED}
+
+
+def _not_a_label(curie, s):
+    s = (s or "").strip()
+    if _ID_COLON.match(s):
+        return "another identifier"
+    m = _ID_UNDER.match(s)
+    if m and m.group(1) in _KNOWN_SPELLED:
+        return "another identifier"
+    if not re.search(r"[^\W\d_]", s):
+        return "no letters"
+    if norm(s) in (norm(curie), norm(curie.partition(":")[2])):
+        return "the identifier again"
+    if s.upper() in _KNOWN_UPPER:
+        return "an ontology's name"
+    if _SNAKE.match(s):
+        status, cur, syns, _d = resolve(curie)
+        if status != "UNRESOLVED" and not any(_SNAKE.match(x or "") for x in [cur] + list(syns)):
+            return "a code name"
+    return None
+
+
 _kept = []
 for _p in pairs:
-    (_NOT_SHAPE if _not_id_shape(_p[0]) else _kept).append(_p)
+    if _not_id_shape(_p[0]):
+        _NOT_SHAPE.append(_p)
+        continue
+    _alt = _p[4] if len(_p) > 4 else None
+    _why = _not_a_label(_p[0], _p[1])
+    if _why and _alt is not None and not _not_a_label(_p[0], _alt):
+        # a label sat on both sides and only one of them is a name: judge that one
+        _p, _why = (_p[0], _alt, _p[2], _p[3], None), None
+    elif not _why and _alt is not None and _not_a_label(_p[0], _alt):
+        _p = (_p[0], _p[1], _p[2], _p[3], None)
+    if _why:
+        _NOT_LABEL.append((_p[0], _p[1], _p[2], _p[3], _why))
+    else:
+        _kept.append(_p)
 pairs = _kept
 
 src = ("offline-map" if OFFLINE is not None
@@ -1400,6 +1459,10 @@ if _NOT_SHAPE:
     print("not id-shaped  : %d pair%s set aside -- lower-case unknown prefix and no digit in the local part (e.g. %s) -- NOT checked"
           % (len(_NOT_SHAPE), "" if len(_NOT_SHAPE) == 1 else "s",
              ", ".join(sorted({p[0] for p in _NOT_SHAPE})[:4])))
+if _NOT_LABEL:
+    print("not a label    : %d pair%s set aside -- the text beside the identifier is %s -- NOT checked"
+          % (len(_NOT_LABEL), "" if len(_NOT_LABEL) == 1 else "s",
+             ", ".join(sorted({p[4] for p in _NOT_LABEL}))))
 if RS_LEX_WARN:
     print("lexer warnings : %d place%s where a reader lost its place -- pairs after %s may be missing:"
           % (len(RS_LEX_WARN), "" if len(RS_LEX_WARN) == 1 else "s", "it" if len(RS_LEX_WARN) == 1 else "each"))
@@ -1409,7 +1472,10 @@ print("")
 
 if not pairs:
     print("EMPTY SCAN — zero (CURIE, label) pairs were found%s." % (
-        " to judge (%d set aside as not identifier-shaped)" % len(_NOT_SHAPE) if _NOT_SHAPE else ""))
+        " to judge (%s)" % ", ".join(
+            x for x in ("%d set aside as not identifier-shaped" % len(_NOT_SHAPE) if _NOT_SHAPE else "",
+                        "%d set aside as not a label" % len(_NOT_LABEL) if _NOT_LABEL else "") if x)
+        if (_NOT_SHAPE or _NOT_LABEL) else ""))
     print("This is UNKNOWABLE, not clean: an empty scan proves nothing about the")
     print("tree. Check the scan root, the file extensions, and the extractors.")
     print("")
@@ -1418,7 +1484,9 @@ if not pairs:
     write_json({"version": VERSION, "verdict": "EMPTY-SCAN", "pairs": [],
                 "counts": {"ok": 0, "synonym": 0, "mismatch": 0,
                            "unresolved": 0, "obsolete": 0,
-                           "not_identifier_shaped": len(_NOT_SHAPE)},
+                           "not_identifier_shaped": len(_NOT_SHAPE), "not_a_label": len(_NOT_LABEL)},
+                "not_a_label_pairs": [
+                    {"curie": p[0], "written": p[1], "file": p[2], "line": p[3], "why": p[4]} for p in _NOT_LABEL],
                 "not_identifier_shaped_pairs": [
                     {"curie": p[0], "written": p[1], "file": p[2], "line": p[3]} for p in _NOT_SHAPE],
                 "rust_ids": RS_IDS, "script_ids": SC_IDS}, indent=2)
@@ -1502,7 +1570,9 @@ write_json({"version": VERSION, "verdict": verdict, "exit": code,
                        "mismatch": c["MISMATCH"],
                        "unresolved": c["UNRESOLVED"],
                        "obsolete": c["OBSOLETE"], "pairs": len(rows),
-                       "not_identifier_shaped": len(_NOT_SHAPE)},
+                       "not_identifier_shaped": len(_NOT_SHAPE), "not_a_label": len(_NOT_LABEL)},
+            "not_a_label_pairs": [
+                {"curie": p[0], "written": p[1], "file": p[2], "line": p[3], "why": p[4]} for p in _NOT_LABEL],
             "not_identifier_shaped_pairs": [
                 {"curie": p[0], "written": p[1], "file": p[2], "line": p[3]} for p in _NOT_SHAPE],
             "rust_ids": RS_IDS, "script_ids": SC_IDS,
