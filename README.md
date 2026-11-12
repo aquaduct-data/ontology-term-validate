@@ -66,18 +66,25 @@ a scan that finds nothing wrong, so it gets its own code and its own words.
 
 ## What it reads
 
-`.java .rst .yaml .yml .json .md .txt .py .proto .kt .ts .js .rs`
+`.java .rst .yaml .yml .json .md .mdx .markdown .txt .py .proto .kt .rs`
+`.ts .tsx .js .jsx .mjs .cjs .mts .cts`
 
-Six extractors: `ontologyClass("ID", "label")` calls, Java builder chains
+`ontologyClass("ID", "label")` calls, Java builder chains
 (`.setId(...).setLabel(...)`), `id:` / `label:` pairs in YAML and reStructuredText
 literal blocks, and JSON — which is parsed **structurally**, never by regex,
 because a Java-shaped pattern applied to JSON matches the wrong neighbouring
-string — plus two for Rust.
+string. Rust, and JavaScript/TypeScript with Markdown, each have their own
+reader, described below.
+
+Not opened at all: `.html`, `.vue`, `.svelte`. Terms kept only there give a
+clean-looking exit 3.
 
 ### Rust
 
 Rust source writes terms in shapes the others cannot see, so `.rs` files get
-their own two extractors and nothing else:
+their own reader and nothing else. It finds string literals with a lexer, the
+way the compiler does: plain, multi-line and `\`-continued strings, raw strings
+(`r"..."`, `r#"..."#`), char literals and nested block comments.
 
 ```rust
 HpoTermData::from_str("HP:0000574", "Thick eyebrow", "excluded")  // identifier, then label
@@ -104,16 +111,22 @@ An inline struct — `Ref { id: "..", label: ".." }`, opened and closed on one
 line — keeps its fields to that line. It never takes a label from the struct
 around it, and it does not stop the outer struct finding its own.
 
-Identifiers never paired with a label **anywhere in the scan** are counted in
-the header (`unlabelled ids : N … NOT checked`), so a clean verdict is never
-mistaken for every identifier having been looked at. An identifier that is
-paired in one place and bare in another is not in that count.
+A JSON object written inside a string literal (`r#"{"id": "..", "label": ".."}"#`)
+is read as JSON.
+
+**Every identifier is accounted for.** Each identifier with a known prefix
+inside any string literal or comment is found by a plain search of the text,
+independent of the reader, and ends in exactly one place: paired with a label
+at that exact position, or counted in the header
+(`unlabelled ids : N … NOT checked`). A clean verdict is never mistaken for
+every identifier having been looked at. The count is by occurrence: an
+identifier paired in one place and bare in another is counted for the bare one.
 
 **Limits.** Read a Rust `MISMATCH` before acting on it, and do not read a clean
 result as proof.
 
 - Identifiers must be colon form. An underscore form would turn every
-  `NM_000138.5` into a pair.
+  `NM_000138.5` into a pair. `HP_0001250` is counted as unlabelled, never paired.
 - A positional argument beside an identifier is *assumed* to be its label, so
   a call that passes a gene identifier and then a transcript accession yields a
   pair that is not one, and
@@ -121,26 +134,84 @@ result as proof.
   message as a mismatched label.
 - Code inside comments is read, as it is by the other extractors. A wrong pair
   in a commented-out line is still reported.
-- Strings are found by pattern, not by a Rust lexer. Raw strings (`r"..."`,
-  `r#"..."#`) are not read, and nothing reports that they were skipped. A raw
-  string, a `'"'` char literal or the last line of a multi-line string can also
-  hide the pairs that follow it **on the same line**.
-- Braces are counted as characters when working out what is inline, so a `{` or
-  `}` inside a string literal on the same line can mislead it.
+- Byte and C strings (`b".."`, `br".."`, `c".."`) are bytes, not text. They are
+  never paired; an identifier inside one is counted as unlabelled.
+- A string or block comment that never closes is reported in the header
+  (`lexer warnings`), and everything after it is searched for identifiers but
+  not paired.
 - An identifier at the end of `f("HP:..", "label", "MONDO:..")` has no label
   after it and is left unpaired — counted as unlabelled, not checked.
-- Not read at all: `"HP:.." => "label"` map entries, an identifier followed by a
-  method call (`"HP:..".parse().unwrap(), "label"`), a block comment between two
-  arguments, a label continued across lines with `\`, and a `label:` field more
-  than three lines from its `id:`.
+- Not paired, and counted as unlabelled: `"HP:.." => "label"` map entries, an
+  identifier followed by a method call (`"HP:..".parse().unwrap(), "label"`),
+  and a `label:` field more than three lines from its `id:`.
+- A pair whose "identifier" has a lower-case unknown prefix and no digit
+  (`"enable:sort"`) is set aside as not identifier-shaped, printed in the
+  header and listed in the JSON report. It is not judged.
 
-`.mjs` is deliberately **not** on that list. If you keep terms in an `.mjs` file
-they will not be scanned, and you will get a clean-looking exit 3.
+### JavaScript, TypeScript and Markdown
+
+Script files get their own reader too, and nothing else. It reads:
+
+```ts
+const shelf = [{ id: 'HP:0001250', label: 'Seizure', selected: false }];
+const term = { hpoId: 'HP:0001250', status: 'observed', hpoLabel: 'Seizure' };
+const c = ontologyClass('HP:0001250', 'Seizure');
+const d = new OntologyClass().setId('HP:0001250').setLabel('Seizure');
+const ABBREVIATIONS = {
+  'HP:0000006': 'AD',   // Autosomal dominant inheritance
+};
+const STATES = {
+  Mild: 'observed;HP:0012825', // Mild (HP:0012825)
+};
+```
+
+and in Markdown, link text that ends in an identifier —
+`[Ventricular septal defect HP:0001629](https://...)`, also when the line breaks
+before the identifier — and the script shapes above inside fences tagged
+`js`, `ts`, `json` or untagged.
+
+Each shape is narrowed until what sits beside the identifier is a name and not
+just some text:
+
+- A pair is made **within one object**. A label key is `label` or `name`; a
+  longer key (`hpoLabel`, `diseaseName`) counts only when what comes before it
+  matches what comes before `id` (`hpoId`, `diseaseId`). `parentLabel` beside
+  `id` is someone else's label.
+- A call is read only when the function's name says it makes a term
+  (it contains `ontology`, `term`, `curie`, `concept`, `phenotyp`, `disease` or
+  `hpo`), and only with exactly two string arguments. `track('HP:..', 'click')`
+  is not a pair.
+- A `// Name (ID)` comment is read only at the end of a line of code that
+  itself contains that ID.
+- A template string with `${...}` in it is never a label.
+
+The same accounting applies: every identifier with a known prefix in these
+files is counted, and is either paired at that exact position or printed as
+unlabelled. The prefix must be spelled as the ontology spells it (`HP:`), or in
+any case when a digit follows (`hp:0001250`).
+
+**Limits.** Read a `MISMATCH` from these files before acting on it.
+
+- `name` beside an identifier is taken for the term's name, so
+  `{ id: 'HP:..', name: 'btn-x' }` is reported as a mismatch.
+- The comment that ends an identifier-keyed entry is taken for the name
+  whatever it says (`// legacy`, `// TODO`).
+- Markdown link text before an identifier is taken for the name
+  (`[see HP:..](...)` reads as "see").
+- Not read: a pair split between two statements, `id = '...'` assignments, and
+  a table from an identifier straight to its name with no comment.
+- JSX text with an apostrophe in it makes the reader lose that line, and it
+  says so in the header.
+- In UI code the unlabelled count can include things that are not identifiers
+  (`{ go: 1 }` written as `go:1`). It over-counts; it does not drop.
+- An identifier with an escape in its first characters (`'HP\x3a0001250'`) is
+  not counted, and one with an escape later is counted only up to the escape.
+  Neither gives a pair.
 
 ## Options
 
 ```
---json <file>            also write a machine-readable report
+--json <file>            also write a machine-readable report (includes the unlabelled counts)
 --offline-map <file>     resolve from a local TSV instead of the network
 --no-network             make every lookup fail, to prove fail-closed behaviour
 --tolerate-unresolved    downgrade exit 4 to 0; pairs are still printed as UNRESOLVED
@@ -179,7 +250,7 @@ run; if a lookup did not answer, you do not know.
 ./ontology-term-validate-selftest.sh
 ```
 
-35 cases, hermetic by default via `--offline-map`, plus live lookups when the
+114 cases, hermetic by default via `--offline-map`, plus live lookups when the
 network is available. Every classification has a case that **plants the defect
 and requires the tool to report it**, so a passing suite means the detector
 still bites.

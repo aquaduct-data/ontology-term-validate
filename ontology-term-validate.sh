@@ -49,10 +49,10 @@
 set -uo pipefail
 # NOTE: no `set -e`. And deliberately no `grep -q` on any pipe anywhere in this
 # file or its selftest: grep exits at the first match, the producer takes
-# SIGPIPE, and under `pipefail` a genuine match reads as a failure. This repo
-# has fixed that same bug four times. Write to a file, then scan the file.
+# SIGPIPE, and under `pipefail` a genuine match reads as a failure. That bug
+# has been made and fixed more than once. Write to a file, then scan the file.
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 usage() {
   cat >&2 <<'USAGE'
@@ -120,7 +120,7 @@ export OTV_TOLERATE="${TOLERATE}"
 export OTV_TIMEOUT="${TIMEOUT}"
 
 python3 - "${ROOTS[@]}" <<'PY'
-import json, os, re, sys, time, urllib.error, urllib.parse, urllib.request
+import bisect, json, os, re, sys, time, urllib.error, urllib.parse, urllib.request
 
 VERSION      = os.environ["OTV_VERSION"]
 JSON_OUT     = os.environ.get("OTV_JSON") or ""
@@ -176,7 +176,8 @@ PREFIX_ONTOLOGY = {
 # Some prefixes are written one way and indexed in OLS4 under another.
 CURIE_PREFIX_ALIAS = {"SCTID": "SNOMED", "NCBITAXON": "NCBITaxon"}
 FILE_EXTS = (".java", ".rst", ".yaml", ".yml", ".json", ".md", ".txt", ".py",
-             ".proto", ".kt", ".ts", ".js", ".rs")
+             ".proto", ".kt", ".ts", ".js", ".rs", ".tsx", ".jsx", ".mjs", ".cjs",
+             ".mts", ".cts", ".mdx", ".markdown")
 SKIP_DIRS = {".git", "target", "build", "node_modules", ".gradle", ".idea",
              "__pycache__", ".mvn", "dist", "venv", ".venv"}
 
@@ -254,14 +255,207 @@ def extract_json(path, text, rel, out):
 # extractors accept (HP_0001250) would turn every transcript accession in Rust
 # source -- "NM_000138.5" -- into a pair with an unknown prefix.
 RS_CURIE_RE = r"[A-Za-z][A-Za-z0-9]*:[A-Za-z0-9][A-Za-z0-9\.\-]*"
-# A string literal on one line. The lookbehind skips the OPENING quote of raw
-# and byte strings (r"..", r#".."#, b".."), so a term written in one is not
-# read -- and nothing reports that: the blind-spot section lists unknown
-# PREFIXES only. Worse, this is a pattern and not a lexer, so a raw string's
-# closing quote, a '"' char literal, or the last line of a multi-line string can
-# be taken as an opening quote, and pairs later ON THAT LINE are then lost
-# silently. Damage is confined to the line. A real lexer would remove this.
-RE_RS_STR = re.compile(r'(?<![A-Za-z0-9_#])"((?:[^"\\\n]|\\.)*)"')
+# ── Rust string lexer ───────────────────────────────────────────────────────
+# Finds the string literals in Rust source the way the compiler does, so a quote
+# the old per-line pattern did not model can no longer knock the reader out of
+# step. Knows: plain "..." (escapes, multi-line, `\`-continued), raw r"..",
+# r#".."#, r##".."## (no escapes), char literals ('"', '\'', '\n', '\u{..}')
+# against lifetimes ('a), and line / nested block comments. Byte (b".."), raw
+# byte (br".."), and C (c"..", cr"..") strings are SKIPPED, not misread: they
+# are bytes, not text, and never become a token. Their SPANS are still recorded,
+# with every other literal's, so an identifier inside one is counted (see the
+# accounting pass at the end of extract_rust).
+#
+# Code inside comments is still read, as the other extractors do. Each comment
+# is its own context: its strings pair only with each other, and a comment
+# between two arguments is blank space to the code around it.
+#
+# FAIL-LOUD ON LOST SYNC. A quote with no closing quote used to cost one line.
+# A lexer that guesses wrong can cost the rest of the file, so an unterminated
+# string or block comment is counted in RS_LEX_WARN and printed in the header;
+# the stray quote is then skipped and reading resumes after it.
+RS_LEX_WARN = []          # "rel:line: what" -- one per place the lexer lost sync
+_RS_IDENT = re.compile(r"\w+")   # unicode-aware, to agree with str.isalnum below
+# An identifier wherever it sits in text, found by its PREFIX: letters, then a
+# colon, then something that can start a local part. A letter or digit before the
+# prefix means it is the tail of a longer word (`9HP:1`, `XHP:1`); an underscore
+# does not (`term_HP:1`). Nothing is required AFTER the identifier: `HP:1_label`
+# is `HP:1` followed by other text, and a lookahead there once made it vanish.
+_RS_PREFIX_AT = re.compile(r"(?<![A-Za-z0-9])([A-Za-z][A-Za-z0-9]*):(?=[A-Za-z0-9])")
+_RS_LOCAL = re.compile(r"[A-Za-z0-9][A-Za-z0-9\.\-]*")
+# The underscore spelling (HP_0001250, and the tail of an OBO PURL). The pairing
+# readers refuse it in Rust, because NM_000138.5 is a transcript and not a term,
+# so it can never be judged here. It is still an identifier somebody wrote, so it
+# is COUNTED, and only when the prefix is spelled exactly as a known ontology's.
+_RS_UNDERSCORE = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]+)_(\d[A-Za-z0-9]*)(?![A-Za-z0-9_])")
+_RS_EXACT_PREFIX = None     # filled on first use: PREFIX_ONTOLOGY keys in their written spelling
+_RS_PLAIN = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"', re.S)
+_RS_COLON = re.compile(r"[ \t\r\n]*:[ \t\r\n]*")
+_RS_WS = re.compile(r"[ \t\r\n]*")
+_RS_LABEL_KEYS = frozenset(("label", "name", "term", "title", "text", "description", "rdfs:label", "preferredlabel"))
+_RS_RAWOPEN = re.compile(r'(#*)"')
+_RS_STR_PREFIX_BYTES = ("b", "br", "c", "cr")
+
+
+def _rs_lex(text, rel="?"):
+    """-> (tokens, comment_spans). A token is (start, end, value, ctx, raw): ctx
+    0 is code, any other number names the comment the string sits in."""
+    toks, spans, kspans, ctx_counter = [], [], [], [0]
+    lits = []          # (start, end) of EVERY string literal, any kind: plain, raw, byte, C
+    n = len(text)
+
+    lost = []          # offsets where the lexer lost sync (an unclosed string or comment)
+
+    def warn(pos, what):
+        lost.append(pos)
+        RS_LEX_WARN.append("%s:%d: %s" % (rel, text.count("\n", 0, pos) + 1, what))
+
+    def block_end(i, end):
+        """Offset just past the (nested) block comment opening at i, or end."""
+        depth, k = 0, i
+        while k < end:
+            if text.startswith("/*", k):
+                depth += 1; k += 2
+            elif text.startswith("*/", k):
+                depth -= 1; k += 2
+                if depth == 0:
+                    return k, True
+            else:
+                k += 1
+        return end, False
+
+    def scan(i, end, mode, ctx):
+        while i < end:
+            ch = text[i]
+            if mode == "code" and text.startswith("//", i):
+                j = text.find("\n", i, end)
+                j = end if j < 0 else j
+                ctx_counter[0] += 1
+                spans.append((i, j))
+                scan(i + 2, j, "line", ctx_counter[0])
+                i = j
+                continue
+            if mode != "line" and text.startswith("/*", i):
+                j, closed = block_end(i, end)
+                if not closed:
+                    warn(i, "block comment never closes")
+                ctx_counter[0] += 1
+                c = ctx_counter[0]
+                if mode == "code":
+                    spans.append((i, j))
+                scan(i + 2, j - 2 if closed else j, "block", c)
+                i = j
+                continue
+            if ch == "'":
+                # char literal or lifetime. '\x' -> closes at the next quote
+                # after the escaped character; 'x' -> exactly one char.
+                if i + 1 < end and text[i + 1] == "\\":
+                    j = text.find("'", i + 3, min(end, i + 14))
+                    if j >= 0 and "\n" not in text[i:j]:
+                        i = j + 1
+                        continue
+                elif i + 2 < end and text[i + 1] != "\n" and text[i + 2] == "'":
+                    i += 3
+                    continue
+                i += 1          # a lifetime / label: only the quote itself
+                continue
+            if ch == '"' or ch == "_" or ch.isalnum():
+                kind, k, body_at = "plain", i, None
+                if ch != '"':
+                    m = _RS_IDENT.match(text, i, end)
+                    word = m.group(0)
+                    k = m.end()
+                    raw = word in ("r", "br", "cr")
+                    if raw and k < end:
+                        mo = _RS_RAWOPEN.match(text, k, end)
+                        if mo:
+                            kind, body_at = "raw", mo
+                    if kind != "raw":
+                        if word in _RS_STR_PREFIX_BYTES and k < end and text[k] == '"':
+                            kind = "bytes"
+                        else:
+                            i = k       # an ordinary identifier or number
+                            continue
+                    pre = word
+                else:
+                    pre = ""
+                if kind == "raw":
+                    hashes = body_at.group(1)
+                    close = '"' + hashes
+                    j = text.find(close, body_at.end(), end)
+                    if j < 0:
+                        if mode == "code":
+                            warn(i, "raw string never closes")
+                        i = body_at.end()
+                        continue
+                    lits.append((i, j + len(close)))
+                    if pre == "r":
+                        toks.append((i, j + len(close), text[body_at.end():j], ctx, True))
+                        # The quoted strings INSIDE a raw string (an embedded
+                        # JSON fixture) are read as candidates too, each blob
+                        # in a context of its own, so a wrong pair in it is
+                        # reported even when the same identifier is paired
+                        # correctly elsewhere. Found in review.
+                        ctx_counter[0] += 1
+                        rc, p, key = -ctx_counter[0], body_at.end(), None
+                        while True:
+                            p = text.find('"', p, j)
+                            if p < 0:
+                                break
+                            mm = _RS_PLAIN.match(text, p, j)
+                            if not mm:
+                                # No closing quote from here to the end of the blob.
+                                # Any later quote is reached by this same scan in the
+                                # same state, so it fails the same way: stop, rather
+                                # than retry from every quote (quadratic on pasted
+                                # escaped JSON).
+                                break
+                            val = _rs_unescape(mm.group(0)[1:-1])
+                            colon = _RS_COLON.match(text, mm.end(), j)
+                            if colon:
+                                # A JSON key is a name, not a label. It is blanked
+                                # (with its colon) so `"id": X, "label": Y` reads as
+                                # two adjacent literals, and remembered so the value
+                                # can be judged by it. Looked at by index: slicing the
+                                # rest of the blob per string made big blobs quadratic.
+                                kspans.append((p, colon.end()))
+                                key = (val.lower(), colon.end())
+                                p = colon.end()
+                                continue
+                            # Under a key, a string is a candidate only if it is an
+                            # identifier or the key says it is a label; `"note": "x"`
+                            # next to an id is not a pair.
+                            if (key is not None and key[1] <= p
+                                    and _RS_WS.fullmatch(text, key[1], p)
+                                    and key[0] not in _RS_LABEL_KEYS
+                                    and not key[0].endswith("label")
+                                    and re.fullmatch(RS_CURIE_RE, val) is None):
+                                key = None
+                                p = mm.end()
+                                continue
+                            key = None
+                            toks.append((p, mm.end(), val, rc, False))
+                            p = mm.end()
+                    i = j + len(close)
+                    continue
+                q = k if ch != '"' else i      # offset of the opening quote
+                m = _RS_PLAIN.match(text, q, end)
+                if not m:
+                    if mode == "code":      # prose in a comment may hold a lone quote
+                        warn(q, "string never closes")
+                    i = q + 1
+                    continue
+                lits.append((i, m.end()))
+                if kind == "plain":
+                    toks.append((i, m.end(), _rs_unescape(m.group(0)[1:-1]), ctx, False))
+                i = m.end()
+                continue
+            i += 1
+
+    scan(0, n, "code", 0)
+    return toks, spans, kspans, lits, (min(lost) if lost else None)
+
+
 _RS_WRAP = r'(?:&\s*)?(?:(?:Some|String::from)\s*\(\s*)?'
 _RS_TAIL = r'(?:\s*\.\s*(?:to_string|to_owned|into)\(\s*\))?\s*\)?'
 # What may sit between two literals for them to count as ADJACENT ARGUMENTS:
@@ -326,11 +520,43 @@ def _rs_blank_inline(s):
 # NOT checked, so a clean verdict is never read as "every identifier was looked
 # at". Sets, across the whole scan -- a per-file sum counted the same
 # identifier once per file and still called the total "distinct".
-RS_SEEN, RS_PAIRED = set(), set()
+def _ids_in(text, a_, b_, exact):
+    """Every identifier with a known prefix written in text[a_:b_].
+    -> [(offset, text as written, identifier)]; `written` is None for the
+    underscore spelling. exact=True wants the prefix spelled as the ontology
+    spells it; False takes any case, which is right inside a string."""
+    global _RS_EXACT_PREFIX
+    if _RS_EXACT_PREFIX is None:
+        _RS_EXACT_PREFIX = set(PREFIX_ONTOLOGY) | set(CURIE_PREFIX_ALIAS.values())
+    heads = [m for m in _RS_PREFIX_AT.finditer(text, a_, b_)
+             if (m.group(1) in _RS_EXACT_PREFIX if exact else m.group(1).upper() in PREFIX_ONTOLOGY)]
+    found = []
+    for n_, m in enumerate(heads):
+        end = _RS_LOCAL.match(text, m.end(), b_).end()
+        # `HP:1-HP:2` and `HP:1.HP:2`: the local part of the first must not
+        # swallow the prefix of the second, or the second is never seen.
+        if n_ + 1 < len(heads) and heads[n_ + 1].start() < end:
+            end = heads[n_ + 1].start()
+        written = text[m.start():end]
+        found.append((m.start(), written, written.rstrip(".-")))
+    for m in _RS_UNDERSCORE.finditer(text, a_, b_):
+        if m.group(1) in _RS_EXACT_PREFIX:
+            found.append((m.start(1), None, "%s:%s" % (m.group(1), m.group(2))))
+    return found
+
+
+RS_IDS = {"occurrences": 0, "paired": 0, "unchecked": 0}
+RS_OCC = set()      # (file, offset, 0, identifier): one per occurrence NOT paired
+
+
+_RS_ESC = re.compile(r'\\(?:\r?\n[ \t\r\n]*|(["\\\']))')
 
 
 def _rs_unescape(s):
-    return s.replace('\\"', '"').replace("\\\\", "\\")
+    """Backslash-quote, backslash-backslash and backslash-apostrophe lose their
+    backslash; a backslash at the end of a line also drops the newline and the
+    next line's indentation, as the compiler does. Nothing else is touched."""
+    return _RS_ESC.sub(lambda m: m.group(1) or "", s)
 
 
 def extract_rust(text, rel, out):
@@ -350,6 +576,7 @@ def extract_rust(text, rel, out):
        within three lines at the same indentation.
     """
     first_new = len(out)
+    paired_off = set()      # offsets of identifier tokens that made a pair
     starts = [0]
     for m in re.finditer(r"\n", text):
         starts.append(m.end())
@@ -364,20 +591,44 @@ def extract_rust(text, rel, out):
                 hi = mid - 1
         return lo + 1
 
-    toks = [(m.start(), m.end(), _rs_unescape(m.group(1))) for m in RE_RS_STR.finditer(text)]
+    toks, spans, kspans, lits, lost_at = _rs_lex(text, rel)
+    # Gaps between code tokens are read from the text with comments blanked, so
+    # `"HP:1", /* note */ "Seizure"` is two adjacent arguments. Inside one
+    # comment the raw text is used (its own commas are real).
+    blank = list(text)
+    for a, b in spans:
+        for k in range(a, b):
+            if blank[k] != "\n":
+                blank[k] = " "
+    blank = "".join(blank)
+    # Inside a raw JSON blob only the KEYS (and their colons) are blanked, never
+    # the surrounding comment: a blob in a commented-out line keeps its commas.
+    keyblank = list(text)
+    for a, b in kspans:
+        for k in range(a, b):
+            if keyblank[k] != "\n":
+                keyblank[k] = " "
+    keyblank = "".join(keyblank)
 
     def adjacent(i, j):
-        return RE_RS_BETWEEN.match(text[toks[i][1]:toks[j][0]]) is not None
+        c = toks[i][3]
+        src = text if c > 0 else (keyblank if c < 0 else blank)
+        return RE_RS_BETWEEN.match(src[toks[i][1]:toks[j][0]]) is not None
 
     # A CHAIN is a maximal run of adjacent literals: one argument list, one
-    # tuple, one flat array. Order is decided per chain, never per file.
-    chains, cur = [], []
+    # tuple, one flat array. Order is decided per chain, never per file. Code
+    # and each comment chain separately, so a string inside a comment never
+    # sits between two arguments.
+    chains, cur_by_ctx = [], {}
     for i in range(len(toks)):
+        cur = cur_by_ctx.get(toks[i][3])
         if cur and not adjacent(cur[-1], i):
-            chains.append(cur); cur = []
+            chains.append(cur); cur = None
+        if cur is None:
+            cur = cur_by_ctx[toks[i][3]] = []
         cur.append(i)
-    if cur:
-        chains.append(cur)
+    chains.extend(c for c in cur_by_ctx.values() if c)
+    chains.sort(key=lambda c: c[0])
 
     for chain in chains:
         vals = [toks[i][2] for i in chain]
@@ -398,6 +649,7 @@ def extract_rust(text, rel, out):
                 idv, lab = vals[k + off], vals[k + 1 - off]
                 if _rs_label_ok(lab):
                     out.append((idv, lab.strip(), rel, lineno(toks[chain[k + off]][0]), None))
+                    paired_off.add(toks[chain[k + off]][0])
             continue
         # Not a table: each identifier takes the literal AFTER it. A literal
         # already taken that way is never offered again as someone's "other side".
@@ -417,10 +669,17 @@ def extract_rust(text, rel, out):
                 # (identifier, label, file), which let one ambiguous call excuse
                 # an unambiguous mismatch elsewhere in the same file.
                 out.append((vals[k], nxt, rel, line_no, prv))
+                paired_off.add(toks[chain[k]][0])
             elif prv is not None:
                 out.append((vals[k], prv, rel, line_no, None))
+                paired_off.add(toks[chain[k]][0])
 
+    field_off = set()       # offset, in the text, of each identifier the struct-field reader paired
     lines = text.splitlines()
+    line_at, _o = [], 0     # where each of those lines starts, by the same splitting
+    for _l in text.splitlines(keepends=True):
+        line_at.append(_o)
+        _o += len(_l)
     for idx, line in enumerate(lines):
         for m in RE_RS_FIELD_ID.finditer(line):
             stem, curie = m.group(1), m.group(2)
@@ -476,10 +735,422 @@ def extract_rust(text, rel, out):
                             break
             if found:
                 out.append((curie, found, rel, idx + 1, None))
+                field_off.add(line_at[idx] + m.start(2))
 
-    RS_PAIRED.update(row[0] for row in out[first_new:])
-    RS_SEEN.update(v for _, _, v in toks
-                   if re.fullmatch(RS_CURIE_RE, v) and v.split(":", 1)[0].upper() in PREFIX_ONTOLOGY)
+    # ── ACCOUNTING, one pass, by position ──────────────────────────────────────
+    # Every identifier with a known prefix that sits inside ANY string literal
+    # (plain, raw, byte, C) or ANY comment is an occurrence. It ends in exactly
+    # one place: PAIRED, if it is the whole value of a token that a reader above
+    # paired with a label; otherwise UNCHECKED, and printed as NOT checked.
+    #
+    # This replaces two loops that asked, shape by shape, "was this one already
+    # handled?". Five review rounds each found a shape for which the answer was
+    # wrongly yes: a JSON key, escaped JSON, an id at the start of a longer
+    # string, raw byte strings, raw C strings. The question is no longer asked.
+    # An occurrence is found by a search of the text, independent of how the
+    # readers tokenise, and is paired only by an exact positional match. A shape
+    # nobody has thought of yet is therefore counted, not dropped.
+    #
+    # Not found, because the text does not contain it as written: an identifier
+    # split across two lines; one glued to a letter or digit before it.
+    # Where the lexer lost its place, everything after that point is searched.
+    regions = lits + spans
+    if lost_at is not None:
+        # The lexer lost its place (a string or comment that never closes). From
+        # there to the end of the file it cannot say what is a string, so all of
+        # it is searched: an identifier after the break is counted, not dropped.
+        regions = regions + [(lost_at, len(text))]
+    regions = sorted(regions)
+    merged = []
+    for a_, b_ in regions:
+        if merged and a_ <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b_)
+        else:
+            merged.append([a_, b_])
+    # Where each token's VALUE starts in the text, for tokens that are an identifier
+    # and nothing else. A raw string's value starts after r, its hashes and the quote.
+    id_at = {}
+    for t in toks:
+        if re.fullmatch(RS_CURIE_RE, t[2]) is None:
+            continue
+        v0 = t[0] + 1
+        if t[4]:
+            while text[v0 - 1] != '"':
+                v0 += 1
+        id_at[v0] = t
+    for a_, b_ in merged:
+        seen_here = []
+        for at, written, c in _ids_in(text, a_, b_, False):
+            tk = id_at.get(at)
+            # PAIRED, by position and nothing looser: the chain readers paired the
+            # token that starts exactly here and IS this identifier, or the
+            # struct-field reader matched the identifier at exactly this offset.
+            # The underscore spelling (written is None) is never paired.
+            paired = written is not None and (
+                (tk is not None and tk[2] == written and tk[0] in paired_off) or at in field_off)
+            seen_here.append((at, c, paired))
+        for off, c, paired in seen_here:
+            RS_IDS["occurrences"] += 1
+            if paired:
+                RS_IDS["paired"] += 1
+            else:
+                RS_IDS["unchecked"] += 1
+                RS_OCC.add((rel, off, 0, c))
+
+# ── JavaScript / TypeScript, and Markdown ────────────────────────────────────
+# Written after a run on a real TypeScript project read 187 files and found no
+# pair, where a reading by hand found 37 and four of them wrong. The shapes are
+# the ones in that project, and each is bounded on purpose:
+#
+#   object literal     { id: 'HP:0001250', label: 'Seizure', selected: false }
+#                      hpoId: '...' with hpoLabel: '...' anywhere in the SAME object
+#   call arguments     ontologyClass('HP:0001250', 'Seizure')
+#   builder chain      .setId('HP:0001250').setLabel('Seizure')
+#   id-keyed table     'HP:0000006': 'AD',   // Autosomal dominant inheritance
+#   comment            Mild: 'observed;HP:0012825',   // Mild (HP:0012825)
+#   Markdown link      [Ventricular septal defect HP:0001629](https://...)
+#   Markdown fences    the script shapes above, inside ```ts / ```js / ```json / bare
+#
+# Each is narrowed until what sits beside the identifier is a name and not just
+# some text. A first version was not, and a review made nine false pairs from
+# ordinary code (`parentLabel`, `track('HP:1', 'click')`, `// See the term (HP:1)`):
+#
+#   - A label key is `label` or `name`. A longer key (`hpoLabel`, `diseaseName`)
+#     counts only when what comes before it matches what comes before `id`
+#     (`hpoId`). `parentLabel` beside `id` is someone else's label.
+#   - A call is read only when the function's name says it makes a term
+#     (_SC_TERM_CALL), and only with exactly two string arguments.
+#   - A `// Name (ID)` comment is read only at the end of a line of code that
+#     itself contains that ID. A comment standing alone is prose.
+#   - A template string with `${...}` in it is not a literal and is never a label.
+#
+# Still weak, and said so: `name` beside an id is taken for the term's name
+# (`{ id, name: 'btn-x' }`); the comment that ends an id-keyed entry is taken
+# for the name whatever it says (`// legacy`); so is Markdown link text before
+# an id (`[see HP:1](...)`). Each is reported with the text as written.
+#
+# NOT read: a pair split between two statements; `id = '...'` assignments; a
+# table from an identifier to its label with no comment ('HP:1': 'Seizure' is
+# not told apart from 'HP:1': 'AD'); .html, .vue and .svelte files, which are
+# not opened at all.
+#
+# ACCOUNTING, as for Rust and for the same reason: every identifier with a known
+# prefix in the file is an occurrence, found by a search of the raw text that
+# does not depend on the lexer. It is PAIRED only if a reader paired the
+# identifier at exactly that offset. Everything else is counted and printed as
+# NOT checked. The prefix must be spelled as the ontology spells it (`HP:`), or
+# in any case when a digit follows (`hp:0001250`): `so:string` is a TypeScript
+# parameter and `go:embed` is prose. Not seen: an identifier written with an
+# escape inside it ('HP\x3a0001250'), because the search is on the text as written.
+SCRIPT_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts")
+MARKDOWN_EXTS = (".md", ".mdx", ".markdown")
+SC_IDS = {"occurrences": 0, "paired": 0, "unchecked": 0}
+SC_OCC = set()      # (file, offset, 0, identifier): one per occurrence NOT paired
+
+_JS_TOK = re.compile(r'''
+  (?P<ws>\s+)
+ |(?P<lc>//[^\n]*)
+ |(?P<bc>/\*.*?\*/)
+ |(?P<sq>'(?:[^'\\\n]|\\\r\n|\\.)*')
+ |(?P<dq>"(?:[^"\\\n]|\\\r\n|\\.)*")
+ |(?P<w>[A-Za-z_$][\w$]*)
+ |(?P<n>\d[\w.]*)
+ |(?P<p>.)
+''', re.S | re.X)
+_JS_REGEX = re.compile(r'/(?![*/])(?:[^/\\\n\[]|\\.|\[(?:[^\]\\\n]|\\.)*\])+/[A-Za-z]*')
+# A slash starts a regular expression, not a division, after one of these.
+_JS_RE_AFTER_P = frozenset("(,=:[!&|?{};+-*%<>~^")
+_JS_RE_AFTER_W = frozenset(("return", "typeof", "case", "in", "of", "do", "else", "void",
+                            "delete", "throw", "new", "instanceof", "yield", "await"))
+_JS_ESC = re.compile(r'\\(?:u\{([0-9A-Fa-f]{1,6})\}|u([0-9A-Fa-f]{4})|x([0-9A-Fa-f]{2})|(\r\n|[\s\S]))')
+_JS_ESC_CH = {"n": " ", "t": " ", "r": " ", "f": " ", "v": " ", "b": "", "0": ""}
+
+
+def _js_unescape(s):
+    if "\\" not in s:
+        return s
+
+    def one(m):
+        h = m.group(1) or m.group(2) or m.group(3)
+        if h:
+            try:
+                return chr(int(h, 16))
+            except (ValueError, OverflowError):
+                return ""
+        ch = m.group(4)
+        if ch in ("\n", "\r", "\r\n"):
+            return ""                     # a backslash at the end of a line joins the lines
+        return _JS_ESC_CH.get(ch, ch)
+    return _JS_ESC.sub(one, s)
+
+
+def _js_template_end(text, i, b):
+    """text[i] is a backtick. -> the offset just past its closing backtick, or None."""
+    j = i + 1
+    while j < b:
+        ch = text[j]
+        if ch == "\\":
+            j += 2
+        elif ch == "`":
+            return j + 1
+        elif ch == "$" and text.startswith("${", j):
+            j = _js_subst_end(text, j + 2, b)
+            if j is None:
+                return None
+        else:
+            j += 1
+    return None
+
+
+def _js_subst_end(text, j, b):
+    """j is just past `${`. -> the offset just past the brace that closes it, or None."""
+    depth = 1
+    while j < b:
+        ch = text[j]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return j + 1
+        elif ch in "'\"":
+            m = _JS_TOK.match(text, j, b)
+            if m.lastgroup in ("sq", "dq"):
+                j = m.end()
+                continue
+        elif ch == "`":
+            j = _js_template_end(text, j, b)
+            if j is None:
+                return None
+            continue
+        j += 1
+    return None
+
+
+def _js_lex(text, a=0, b=None, rel=None):
+    """-> (tokens, comments).
+
+    token   = (kind, start, end, value): 's' a string with its escapes resolved,
+              'x' a template string with ${...} in it (not a literal),
+              'w' a word, 'n' a number, 'r' a regular expression, 'p' one character.
+    comment = (start, end, is_line_comment).
+    Where it loses its place it says so and skips: to the end of the line for a
+    string, to the end of the text for a template or a block comment.
+    rel=None means do not warn: a Markdown fence is only guessed to be script."""
+    if b is None:
+        b = len(text)
+    toks, comments = [], []
+
+    def lost(at, what):
+        if rel is not None:
+            RS_LEX_WARN.append("%s:%d: %s" % (rel, text.count("\n", 0, at) + 1, what))
+
+    i, prev = a, None
+    while i < b:
+        m = _JS_TOK.match(text, i, b)
+        k, s, e = m.lastgroup, m.start(), m.end()
+        if k == "ws":
+            i = e
+            continue
+        if k in ("lc", "bc"):
+            comments.append((s, e, k == "lc"))
+            i = e
+            continue
+        if k in ("sq", "dq"):
+            prev = ("s", s, e, _js_unescape(text[s + 1:e - 1]))
+        elif k in ("w", "n"):
+            prev = (k, s, e, m.group())
+        else:
+            ch = m.group()
+            if ch == "`":
+                end = _js_template_end(text, s, b)
+                if end is None:
+                    lost(s, "template string never closes")
+                    break
+                # with ${...} in it, it is an expression, not a literal: kind 'x'
+                prev, e = ("x" if "${" in text[s:end] else "s", s, end, text[s + 1:end - 1]), end
+            elif ch in "'\"":
+                eol = text.find("\n", s, b)
+                eol = b if eol < 0 else eol
+                lost(s, "string does not close on its line")
+                i = eol
+                continue
+            elif ch == "/" and text.startswith("/*", s):
+                lost(s, "block comment never closes")
+                break
+            else:
+                r = None
+                if ch == "/" and (prev is None
+                                  or (prev[0] == "p" and prev[3] in _JS_RE_AFTER_P)
+                                  or (prev[0] == "w" and prev[3] in _JS_RE_AFTER_W)):
+                    r = _JS_REGEX.match(text, s, b)
+                if r is not None:
+                    prev, e = ("r", s, r.end(), ""), r.end()
+                else:
+                    prev = ("p", s, e, ch)
+        toks.append(prev)
+        i = e
+    return toks, comments
+
+
+def _sc_known(curie):
+    return curie.partition(":")[0].upper() in PREFIX_ONTOLOGY
+
+
+_SC_FULL = re.compile(RS_CURIE_RE + r"\Z")
+# A function whose name says it makes a term: ontologyClass, OntologyClass, TermId, hpoTerm ...
+_SC_TERM_CALL = re.compile(r"ontology|term|curie|concept|phenotyp|disease|hpo", re.I)
+_SC_COMMENT_PAREN = re.compile(r"//[/!]*[ \t]*([^()\n]{1,120}?)[ \t]*\([ \t]*(" + RS_CURIE_RE
+                               + r")[ \t]*\)\.?[ \t\r]*\Z")
+_SC_COMMENT_BODY = re.compile(r"//[/!]*[ \t]*(.*?)[ \t\r]*\Z", re.S)
+
+
+def _script_pairs(text, lexed, rel, out, paired, line_of):
+    toks, comments = lexed
+    n = len(toks)
+    cstarts = [c[0] for c in comments]
+
+    def is_p(j, chars):
+        return 0 <= j < n and toks[j][0] == "p" and toks[j][3] in chars
+
+    def is_w(j, word):
+        return 0 <= j < n and toks[j][0] == "w" and toks[j][3] == word
+
+    def is_s(j):
+        return 0 <= j < n and toks[j][0] == "s"
+
+    def emit(curie, at, label, alt=None):
+        label = " ".join(label.split())
+        alt = " ".join(alt.split()) if alt else None
+        if not label:
+            label, alt = alt, None
+        if not label:
+            return
+        out.append((curie, label, rel, line_of(at), alt if alt and alt != label else None))
+        paired.add(at)
+
+    def close_object(props):
+        ids, labels = [], []
+        for key, val, k in props:
+            kv, vv = key[3], val[3]
+            if key[0] == "s" and _SC_FULL.match(kv) and _sc_known(kv):
+                # id-keyed table: the label is the comment that ends the line
+                j = k + 3
+                if is_p(j, ","):
+                    j += 1
+                ci = bisect.bisect_left(cstarts, val[2])
+                if ci == len(comments):
+                    continue
+                cs, ce, is_line = comments[ci]
+                if (not is_line or line_of(cs) != line_of(val[2] - 1)
+                        or (j < n and toks[j][1] < cs)
+                        or _SC_COMMENT_PAREN.match(text, cs, ce)):
+                    continue
+                emit(kv, key[1] + 1, _SC_COMMENT_BODY.match(text, cs, ce).group(1), vv)
+                continue
+            low = kv.lower()
+            if (low.endswith("id") or low.endswith("curie")) and _SC_FULL.match(vv):
+                stem = low[:-2] if low.endswith("id") else low[:-5]
+                ids.append((stem.rstrip("_-"), val))
+            elif low.endswith("label"):
+                labels.append((low[:-5].rstrip("_-"), val))
+            elif low.endswith("name"):
+                labels.append((low[:-4].rstrip("_-"), val))
+        for stem, val in ids:
+            cands = [l for l in labels if l[0] == stem and l[1][3].strip()]
+            if not cands and len(ids) == 1:
+                # termId beside a bare `label`: yes. id beside `parentLabel`: no.
+                cands = [l for l in labels if l[0] == "" and l[1][3].strip()]
+            if len(cands) in (1, 2):
+                emit(val[3], val[1] + 1, cands[0][1][3], cands[1][1][3] if len(cands) == 2 else None)
+
+    stack = []
+    for k, t in enumerate(toks):
+        if t[0] == "p" and t[3] in "{[(":
+            if (t[3] == "(" and k > 0 and toks[k - 1][0] == "w" and _SC_TERM_CALL.search(toks[k - 1][3])
+                    and is_s(k + 1) and is_p(k + 2, ",") and is_s(k + 3) and is_p(k + 4, ")")
+                    and _SC_FULL.match(toks[k + 1][3])
+                    and toks[k + 3][3].strip() not in ("", "label", "id", "type")):
+                emit(toks[k + 1][3], toks[k + 1][1] + 1, toks[k + 3][3])
+            stack.append((t[3], []))
+        elif t[0] == "p" and t[3] in "}])":
+            if stack:
+                opener, props = stack.pop()
+                if opener == "{":
+                    close_object(props)
+        elif (t[0] in ("w", "s") and stack and stack[-1][0] == "{" and is_p(k - 1, "{,")
+              and is_p(k + 1, ":") and is_s(k + 2)
+              and (k + 3 >= n or is_p(k + 3, ",}") or is_w(k + 3, "as"))):
+            stack[-1][1].append((t, toks[k + 2], k))
+        elif (is_w(k, "setId") and is_p(k + 1, "(") and is_s(k + 2) and is_p(k + 3, ")")
+              and is_p(k + 4, ".") and is_w(k + 5, "setLabel") and is_p(k + 6, "(")
+              and is_s(k + 7) and is_p(k + 8, ")") and _SC_FULL.match(toks[k + 2][3])):
+            emit(toks[k + 2][3], toks[k + 2][1] + 1, toks[k + 7][3])
+    for opener, props in stack:          # an object the text never closes is still read
+        if opener == "{":
+            close_object(props)
+
+    for cs, ce, is_line in comments:
+        if not is_line:
+            continue
+        m = _SC_COMMENT_PAREN.match(text, cs, ce)
+        if m and _sc_known(m.group(2)) and re.search(r"[A-Za-z]", m.group(1)):
+            bol = text.rfind("\n", 0, cs) + 1
+            if m.group(2) in text[bol:cs]:      # the code this comment ends names the same id
+                emit(m.group(2), m.start(2), m.group(1))
+
+
+def _line_finder(text):
+    starts = [0] + [m.end() for m in re.finditer(r"\n", text)]
+    return lambda off: bisect.bisect_right(starts, off)
+
+
+def _sc_account(text, rel, paired):
+    for off, written, c in _ids_in(text, 0, len(text), False):
+        # spelled as the ontology spells it, or any spelling with a digit after it
+        if (written is not None and written.partition(":")[0] not in _RS_EXACT_PREFIX
+                and not any(ch.isdigit() for ch in written)):
+            continue
+        SC_IDS["occurrences"] += 1
+        if off in paired:
+            SC_IDS["paired"] += 1
+        else:
+            SC_IDS["unchecked"] += 1
+            SC_OCC.add((rel, off, 0, c))
+
+
+def extract_script(text, rel, out):
+    paired = set()
+    lexed = _js_lex(text, 0, len(text), rel)
+    _script_pairs(text, lexed, rel, out, paired, _line_finder(text))
+    _sc_account(text, rel, paired)
+
+
+_MD_FENCE = re.compile(r" {0,3}(`{3,}|~{3,})[ \t]*([\w.+#-]*)")
+_MD_SCRIPT_LANGS = frozenset(("", "js", "javascript", "ts", "typescript", "jsx", "tsx",
+                              "mjs", "cjs", "json", "json5", "jsonc"))
+_MD_LINK = re.compile(r"\[([^\[\]]{1,200}?)[ \t\r\n]+\(?(" + RS_CURIE_RE + r")\)?[ \t\r\n]*\]\(")
+
+
+def extract_markdown(text, rel, out, paired):
+    """Adds to what the line readers found. `paired` already holds their offsets."""
+    line_of = _line_finder(text)
+    pos, fence, body_at = 0, None, 0
+    for line in text.splitlines(True):
+        m = _MD_FENCE.match(line)
+        if fence is None:
+            if m:
+                fence, body_at = (m.group(1)[0], len(m.group(1)), m.group(2).lower()), pos + len(line)
+        elif m and m.group(1)[0] == fence[0] and len(m.group(1)) >= fence[1] and not m.group(2):
+            if fence[2] in _MD_SCRIPT_LANGS:
+                _script_pairs(text, _js_lex(text, body_at, pos, None), rel, out, paired, line_of)
+            fence = None
+        pos += len(line)
+    for m in _MD_LINK.finditer(text):
+        if _sc_known(m.group(2)) and re.search(r"[A-Za-z]", m.group(1)):
+            out.append((m.group(2), " ".join(m.group(1).split()), rel, line_of(m.start(2)), None))
+            paired.add(m.start(2))
+    _sc_account(text, rel, paired)
 
 
 def extract(files):
@@ -504,14 +1175,25 @@ def extract(files):
             # accept underscore identifiers, which in Rust source are accessions.
             extract_rust(text, rel, pairs)
             continue
+        if path.endswith(SCRIPT_EXTS):
+            # Script gets ONLY the script reader, for the same reason: the line
+            # patterns below take `id: 'user_1'` for an identifier.
+            extract_script(text, rel, pairs)
+            continue
 
         lines = text.splitlines()
+        # Where each line starts, so a pair can be accounted for by its offset.
+        line_at, gen_off, _o = [], set(), 0
+        for _l in text.splitlines(True):
+            line_at.append(_o)
+            _o += len(_l)
         for idx, line in enumerate(lines):
             for rx in (RE_ONTCLASS, RE_SETIDLBL):
                 for m in rx.finditer(line):
                     lbl = m.group(2).strip()
                     if lbl and lbl not in ("label", "id", "type"):
                         pairs.append((m.group(1).replace("_", ":"), lbl, rel, idx + 1))
+                        gen_off.add(line_at[idx] + m.start(1))
             mi = RE_YAML_ID.match(line)
             if mi:
                 # Pair `id:` with a `label:` at the SAME indentation, within 3
@@ -542,6 +1224,9 @@ def extract(files):
                         break
                 if found:
                     pairs.append((mi.group(1).replace("_", ":"), found, rel, idx + 1))
+                    gen_off.add(line_at[idx] + mi.start(1))
+        if path.endswith(MARKDOWN_EXTS):
+            extract_markdown(text, rel, pairs, gen_off)
 
     # multi-line Java: setId(...) on one line, setLabel(...) on the next
     for base, path in files:
@@ -669,6 +1354,30 @@ roots = sys.argv[1:]
 files = iter_files(roots)
 pairs, id_tokens, files_read = extract(files)
 
+# NOT AN IDENTIFIER SHAPE. (From review: gene symbols such as HGNC:CFTR have no
+# digit but are real identifiers, and an all-capital prefix is how ontologies write
+# them, so only an ALL-LOWERCASE prefix is set aside.) `enable:sort`, `pg:catalog`, `obo:id` are code, not
+# ontology identifiers. A pair is set aside here ONLY when its prefix is not one
+# we resolve, has no uppercase letter, AND its local part has no digit at all.
+# Every other pair -- any
+# known prefix (so `HP:abc` is still judged), any unknown prefix whose local part
+# has a digit (`B:1`, `MeSH:D003920`), any capitalised prefix (`HGNC:CFTR`) -- goes on to be judged, and an unresolvable
+# one is still UNRESOLVED. What is set aside is counted in the header and listed in the JSON,
+# never folded into OK and never dropped without a word.
+_NOT_SHAPE = []
+
+
+def _not_id_shape(curie):
+    pre, _, local = curie.partition(":")
+    return (pre.upper() not in PREFIX_ONTOLOGY and not any(ch.isdigit() for ch in local)
+            and pre == pre.lower())
+
+
+_kept = []
+for _p in pairs:
+    (_NOT_SHAPE if _not_id_shape(_p[0]) else _kept).append(_p)
+pairs = _kept
+
 src = ("offline-map" if OFFLINE is not None
        else ("disabled(--no-network)" if NO_NETWORK else OLS_BASE))
 print("ontology-term-validate %s" % VERSION)
@@ -677,14 +1386,30 @@ print("files read     : %d" % files_read)
 print("pairs found    : %d" % len(pairs))
 print("distinct CURIEs: %d" % len({p[0] for p in pairs}))
 print("resolver       : %s" % src)
-_unl = len(RS_SEEN - RS_PAIRED)
+_unl = len({o[3] for o in RS_OCC})
 if _unl:
-    print("unlabelled ids : %d distinct Rust identifier%s with no label beside %s — NOT checked"
-          % (_unl, "" if _unl == 1 else "s", "it" if _unl == 1 else "them"))
+    print("unlabelled ids : %d distinct Rust identifier%s with no label beside %s — NOT checked%s"
+          % (_unl, "" if _unl == 1 else "s", "it" if _unl == 1 else "them",
+             "" if len(RS_OCC) == _unl else " [%d occurrences]" % len(RS_OCC)))
+_unl = len({o[3] for o in SC_OCC})
+if _unl:
+    print("unlabelled ids : %d distinct identifier%s in script or Markdown with no label beside %s — NOT checked%s"
+          % (_unl, "" if _unl == 1 else "s", "it" if _unl == 1 else "them",
+             "" if len(SC_OCC) == _unl else " [%d occurrences]" % len(SC_OCC)))
+if _NOT_SHAPE:
+    print("not id-shaped  : %d pair%s set aside -- lower-case unknown prefix and no digit in the local part (e.g. %s) -- NOT checked"
+          % (len(_NOT_SHAPE), "" if len(_NOT_SHAPE) == 1 else "s",
+             ", ".join(sorted({p[0] for p in _NOT_SHAPE})[:4])))
+if RS_LEX_WARN:
+    print("lexer warnings : %d place%s where a reader lost its place -- pairs after %s may be missing:"
+          % (len(RS_LEX_WARN), "" if len(RS_LEX_WARN) == 1 else "s", "it" if len(RS_LEX_WARN) == 1 else "each"))
+    for w in RS_LEX_WARN[:10]:
+        print("                 " + w)
 print("")
 
 if not pairs:
-    print("EMPTY SCAN — zero (CURIE, label) pairs were found.")
+    print("EMPTY SCAN — zero (CURIE, label) pairs were found%s." % (
+        " to judge (%d set aside as not identifier-shaped)" % len(_NOT_SHAPE) if _NOT_SHAPE else ""))
     print("This is UNKNOWABLE, not clean: an empty scan proves nothing about the")
     print("tree. Check the scan root, the file extensions, and the extractors.")
     print("")
@@ -692,7 +1417,11 @@ if not pairs:
     sys.stdout.flush()
     write_json({"version": VERSION, "verdict": "EMPTY-SCAN", "pairs": [],
                 "counts": {"ok": 0, "synonym": 0, "mismatch": 0,
-                           "unresolved": 0, "obsolete": 0}}, indent=2)
+                           "unresolved": 0, "obsolete": 0,
+                           "not_identifier_shaped": len(_NOT_SHAPE)},
+                "not_identifier_shaped_pairs": [
+                    {"curie": p[0], "written": p[1], "file": p[2], "line": p[3]} for p in _NOT_SHAPE],
+                "rust_ids": RS_IDS, "script_ids": SC_IDS}, indent=2)
     print("VERDICT EMPTY-SCAN (UNKNOWABLE) — exit %d" % EXIT_EMPTY)
     sys.exit(EXIT_EMPTY)
 
@@ -772,7 +1501,11 @@ write_json({"version": VERSION, "verdict": verdict, "exit": code,
             "counts": {"ok": c["OK"], "synonym": c["SYNONYM"],
                        "mismatch": c["MISMATCH"],
                        "unresolved": c["UNRESOLVED"],
-                       "obsolete": c["OBSOLETE"], "pairs": len(rows)},
+                       "obsolete": c["OBSOLETE"], "pairs": len(rows),
+                       "not_identifier_shaped": len(_NOT_SHAPE)},
+            "not_identifier_shaped_pairs": [
+                {"curie": p[0], "written": p[1], "file": p[2], "line": p[3]} for p in _NOT_SHAPE],
+            "rust_ids": RS_IDS, "script_ids": SC_IDS,
             "rows": rows}, indent=2, sort_keys=True)
 print("VERDICT %s — exit %d" % (verdict, code))
 sys.exit(code)
