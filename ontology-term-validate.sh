@@ -52,7 +52,7 @@ set -uo pipefail
 # SIGPIPE, and under `pipefail` a genuine match reads as a failure. That bug
 # has been made and fixed more than once. Write to a file, then scan the file.
 
-VERSION="1.2.1"
+VERSION="1.3.0"
 
 usage() {
   cat >&2 <<'USAGE'
@@ -63,7 +63,8 @@ usage: ontology-term-validate.sh [options] <path> [<path>...]
 
 options:
   --json <file>           also write a machine-readable JSON report
-  --offline-map <file>    resolve from a local TSV (CURIE<TAB>label[<TAB>synonym|...])
+  --offline-map <file>    resolve from a local TSV (CURIE<TAB>label[<TAB>synonym|...[<TAB>obsolete]])
+                          a 4th column reading `obsolete` sets the term's OLS4 is_obsolete flag
                           instead of the network. Hermetic; used by the selftest.
   --no-network            make every lookup fail. Proves fail-closed behaviour.
   --tolerate-unresolved   downgrade exit 4 to 0. UNRESOLVED pairs are still
@@ -172,6 +173,11 @@ PREFIX_ONTOLOGY = {
     "CHMO": "chmo", "IAO": "iao", "BFO": "bfo", "RO": "ro", "OPMI": "opmi",
     "BTO": "bto", "CMO": "cmo", "SCTID": "snomed", "OBA": "oba", "FMA": "fma",
     "MMO": "mmo", "VT": "vt", "ZP": "zp", "XAO": "xao", "OGG": "ogg",
+    # Food, environment, microbiology, plants and ecology. Added after a run on a
+    # culture-media knowledge base left 2,795 pairs unjudged for want of them.
+    # Each was read back from OLS4 as a served ontology before being added.
+    "FOODON": "foodon", "ENVO": "envo", "MICRO": "micro", "PO": "po",
+    "AGRO": "agro", "PCO": "pco", "ECOCORE": "ecocore",
 }
 # Some prefixes are written one way and indexed in OLS4 under another.
 CURIE_PREFIX_ALIAS = {"SCTID": "SNOMED", "NCBITAXON": "NCBITaxon"}
@@ -189,14 +195,103 @@ RE_ONTCLASS = re.compile(r'\(\s*"(' + CURIE_RE + r')"\s*,\s*"([^"]{1,200})"\s*\)
 RE_SETIDLBL = re.compile(r'setId\(\s*"(' + CURIE_RE + r')"\s*\)'
                          r'(?:\s*\.\s*)?\s*\.?\s*setLabel\(\s*"([^"]{1,200})"\s*\)')
 # YAML / RST literal blocks:  id: "NCIT:C5189"  then a nearby  label: "..."
-RE_YAML_ID  = re.compile(r'^\s*["\']?id["\']?\s*:\s*["\']?(' + CURIE_RE + r')["\']?\s*,?\s*$')
-RE_YAML_LBL = re.compile(r'^\s*["\']?label["\']?\s*:\s*["\']?(.*?)["\']?\s*,?\s*$')
+# The key may be the first of a list item:  - id: "NCIT:C5189". That is the
+# commonest YAML layout, and it was not read at all until a real file showed it
+# (one public knowledge graph's source: 32,783 `- id:` lines against 225 plain ones).
+RE_YAML_ID  = re.compile(r'^\s*(?:-\s+)?["\']?id["\']?\s*:\s*["\']?(' + CURIE_RE + r')["\']?\s*,?\s*$')
+RE_YAML_LBL = re.compile(r'^\s*(?:-\s+)?["\']?label["\']?\s*:\s*(.*?)\s*$')
+RE_YAML_NAME = re.compile(r'^\s*(?:-\s+)?["\']?name["\']?\s*:\s*(.*?)\s*$')
+RE_YAML_ITEM_KEY = re.compile(r'^(\s*)-(\s+)["\']?[A-Za-z_][A-Za-z0-9_\-]*["\']?\s*:(?:\s|$)')
+_YAML_DQ = re.compile(r'"((?:[^"\\]|\\.)*)"\s*,?\s*(?:#.*)?')
+_YAML_SQ = re.compile(r"'((?:[^']|'')*)'\s*,?\s*(?:#.*)?")
+_YAML_ESC = re.compile(r'\\(?:u([0-9A-Fa-f]{4})|U([0-9A-Fa-f]{8})|x([0-9A-Fa-f]{2})|(.))')
+_YAML_ESC_CHAR = {"n": "\n", "t": "\t", "r": "\r", "0": "\0", " ": " ", "/": "/", '"': '"', "\\": "\\", "_": "\u00a0"}
+
+
+def _yaml_scalar(v):
+    """The value written after `key:`, as YAML reads it for the three plain cases.
+    A double-quoted scalar loses its quotes and has its escapes decoded (\\u03B1
+    is one character, not six); a single-quoted one loses its quotes and reads ''
+    as one apostrophe; a comment after either is not part of the value. Anything
+    else is left as the reader always left it: one stray quote and a trailing
+    comma removed, nothing more."""
+    m = _YAML_DQ.fullmatch(v)
+    if m:
+        def one(e):
+            code = e.group(1) or e.group(2) or e.group(3)
+            if code:
+                try:
+                    return chr(int(code, 16))
+                except (ValueError, OverflowError):
+                    return e.group(0)
+            return _YAML_ESC_CHAR.get(e.group(4), e.group(0))
+        return _YAML_ESC.sub(one, m.group(1))
+    m = _YAML_SQ.fullmatch(v)
+    if m:
+        return m.group(1).replace("''", "'")
+    return re.sub(r'^["\']?(.*?)["\']?\s*,?\s*$', r"\1", v)
+
+
+def _yaml_key_col(line):
+    """-> (column where the mapping's keys start, whether this line opens a list
+    item). `-   id: X` has its keys at the column of `id`, and the keys that
+    follow it sit at that column with no dash. A dash before a plain scalar
+    (`- levonordefrin`) is not a key line; its indentation is what it looks like."""
+    m = RE_YAML_ITEM_KEY.match(line)
+    if m:
+        return len(m.group(1)) + 1 + len(m.group(2)), True
+    return len(line) - len(line.lstrip()), False
+
+
+def _yaml_sibling(lines, idx, rx):
+    """The value of the key `rx` reads, in the SAME mapping as the `id:` at
+    lines[idx]: at the same key column, within 3 lines, after it first and then
+    before it. Stops at another `id:`, at a line that starts another list item,
+    and at any line at a different column. An `id:` that opens a list item is
+    its first key, so nothing above it belongs to it."""
+    ind, opens = _yaml_key_col(lines[idx])
+    for direction in ((1,) if opens else (1, -1)):
+        for step in range(1, 4):
+            j = idx + direction * step
+            if not (0 <= j < len(lines)):
+                break
+            cand = lines[j]
+            if not cand.strip():
+                continue
+            if cand.strip() in ("---", "..."):
+                break                       # another YAML document
+            c_ind, c_opens = _yaml_key_col(cand)
+            if c_ind != ind or RE_YAML_ID.match(cand):
+                break
+            if c_opens and direction == 1:
+                break                       # the next list item: another mapping
+            m = rx.match(cand)
+            if m:
+                v = _yaml_scalar(m.group(1)).strip()
+                if v:
+                    return v
+            if c_opens:
+                break                       # going up: this was the item's first key
+    return None
+# `label` shaped like a Biolink category: one CamelCase word ("Drug", "BiologicalProcess").
+RE_CATEGORY = re.compile(r"[A-Z][a-z0-9]*(?:[A-Z][a-z0-9]*)*")
 
 _ID_TOKEN_RE = re.compile(r'"(' + CURIE_RE + r')"')
 
 
 def norm(s):
     return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+SKIPPED_DIRS = []      # (path relative to its scan root, count of files of a type we read)
+LABEL_DEFERRED = [0]   # times a category-shaped `label` gave way to the `name` beside it
+
+
+def _count_readable(top):
+    n = 0
+    for _dp, _dn, fns in os.walk(top):
+        n += sum(1 for f in fns if f.endswith(FILE_EXTS))
+    return n
 
 
 def iter_files(roots):
@@ -207,6 +302,13 @@ def iter_files(roots):
             continue
         base = os.path.abspath(root)
         for dirpath, dirnames, filenames in os.walk(base):
+            # A skipped directory is not read, but it is COUNTED, so the summary
+            # can say when it holds files of a type this tool reads (a project
+            # may publish its data under build/).
+            for d in sorted(d for d in dirnames if d in SKIP_DIRS):
+                n = _count_readable(os.path.join(dirpath, d))
+                if n:
+                    SKIPPED_DIRS.append((os.path.relpath(os.path.join(dirpath, d), base), n))
             dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
             for fn in sorted(filenames):
                 if fn.endswith(FILE_EXTS):
@@ -235,8 +337,20 @@ def extract_json(path, text, rel, out):
     def walk(o):
         if isinstance(o, dict):
             i, l = o.get("id"), o.get("label")
+            nm = o.get("name")
+            deferred = False
+            # `label` beside `name` and shaped like a Biolink category (one
+            # CamelCase word: "Drug", "BiologicalProcess") is a category, not
+            # the term's name; the name is in `name`. With no `name`, or a
+            # `label` that is not category-shaped, `label` is read as before.
+            if (isinstance(nm, str) and nm.strip() and isinstance(l, str)
+                    and RE_CATEGORY.fullmatch(l.strip())):
+                l = nm
+                deferred = True
             if isinstance(i, str) and isinstance(l, str) and re.fullmatch(CURIE_RE, i):
                 out.append((i.replace("_", ":"), l.strip(), rel, lineno_for(i)))
+                if deferred:
+                    LABEL_DEFERRED[0] += 1   # only where a pair is made, as the YAML path does
             for v in o.values():
                 walk(v)
         elif isinstance(o, list):
@@ -287,7 +401,9 @@ _RS_LOCAL = re.compile(r"[A-Za-z0-9][A-Za-z0-9\.\-]*")
 # readers refuse it in Rust, because NM_000138.5 is a transcript and not a term,
 # so it can never be judged here. It is still an identifier somebody wrote, so it
 # is COUNTED, and only when the prefix is spelled exactly as a known ontology's.
-_RS_UNDERSCORE = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]+)_(\d[A-Za-z0-9]*)(?![A-Za-z0-9_])")
+# Nothing is required after it: `HP_0001250_label` is counted, as
+# `HP:0001250_label` is.
+_RS_UNDERSCORE = re.compile(r"(?<![A-Za-z0-9])([A-Za-z]+)_(\d[A-Za-z0-9]*)")
 _RS_EXACT_PREFIX = None     # filled on first use: PREFIX_ONTOLOGY keys in their written spelling
 _RS_PLAIN = re.compile(r'"[^"\\]*(?:\\.[^"\\]*)*"', re.S)
 _RS_COLON = re.compile(r"[ \t\r\n]*:[ \t\r\n]*")
@@ -783,11 +899,16 @@ def extract_rust(text, rel, out):
         for at, written, c in _ids_in(text, a_, b_, False):
             tk = id_at.get(at)
             # PAIRED, by position and nothing looser: the chain readers paired the
-            # token that starts exactly here and IS this identifier, or the
-            # struct-field reader matched the identifier at exactly this offset.
+            # token whose value starts exactly here (id_at holds only tokens that
+            # are an identifier and nothing else), or the struct-field reader
+            # matched the identifier at exactly this offset. The token's value is
+            # NOT compared with the text as written: they differ only when the
+            # identifier is broken by a backslash at the end of a line, and that
+            # one is judged as a pair, so it is paired here too and not printed a
+            # second time as a cut-off, unchecked identifier.
             # The underscore spelling (written is None) is never paired.
             paired = written is not None and (
-                (tk is not None and tk[2] == written and tk[0] in paired_off) or at in field_off)
+                (tk is not None and tk[0] in paired_off) or at in field_off)
             seen_here.append((at, c, paired))
         for off, c, paired in seen_here:
             RS_IDS["occurrences"] += 1
@@ -1119,6 +1240,30 @@ def _sc_account(text, rel, paired):
             SC_OCC.add((rel, off, 0, c))
 
 
+YAML_EXTS = (".yaml", ".yml")
+YAML_IDS = {"occurrences": 0, "paired": 0, "unchecked": 0}
+YAML_OCC = set()    # (file, offset, 0, identifier): one per occurrence NOT paired
+
+
+def _yaml_account(text, rel, paired):
+    """Every identifier with a known prefix written anywhere in a YAML file is an
+    occurrence, found by a search of the text and not by the reader. It is PAIRED
+    only if the reader paired the identifier at exactly that offset; otherwise it
+    is counted and printed as NOT checked. So a layout the reader does not know
+    (a flow mapping, a key other than `id`, a label four lines away) is counted,
+    not dropped."""
+    for off, written, c in _ids_in(text, 0, len(text), False):
+        if (written is not None and written.partition(":")[0] not in _RS_EXACT_PREFIX
+                and not any(ch.isdigit() for ch in written)):
+            continue
+        YAML_IDS["occurrences"] += 1
+        if off in paired:
+            YAML_IDS["paired"] += 1
+        else:
+            YAML_IDS["unchecked"] += 1
+            YAML_OCC.add((rel, off, 0, c))
+
+
 def extract_script(text, rel, out):
     paired = set()
     lexed = _js_lex(text, 0, len(text), rel)
@@ -1202,31 +1347,21 @@ def extract(files):
                 # borrows a sibling block's label — e.g. in docs/evidence.rst it
                 # paired `id: "PMID:30962759"` (whose sibling key is
                 # `description:`, not `label:`) with the ECO label two lines up.
-                ind = len(line) - len(line.lstrip())
-                found = None
-                for direction in (1, -1):
-                    for step in range(1, 4):
-                        j = idx + direction * step
-                        if not (0 <= j < len(lines)):
-                            break
-                        cand = lines[j]
-                        if not cand.strip():
-                            continue
-                        if len(cand) - len(cand.lstrip()) != ind:
-                            break
-                        if RE_YAML_ID.match(cand):
-                            break
-                        ml = RE_YAML_LBL.match(cand)
-                        if ml and ml.group(1).strip():
-                            found = ml.group(1).strip()
-                            break
-                    if found:
-                        break
+                found = _yaml_sibling(lines, idx, RE_YAML_LBL)
+                if found and RE_CATEGORY.fullmatch(found):
+                    # Same rule as JSON: a category-shaped `label` beside a `name`
+                    # in the same mapping is a category; the name is checked.
+                    nm = _yaml_sibling(lines, idx, RE_YAML_NAME)
+                    if nm:
+                        found = nm
+                        LABEL_DEFERRED[0] += 1
                 if found:
                     pairs.append((mi.group(1).replace("_", ":"), found, rel, idx + 1))
                     gen_off.add(line_at[idx] + mi.start(1))
         if path.endswith(MARKDOWN_EXTS):
             extract_markdown(text, rel, pairs, gen_off)
+        if path.endswith(YAML_EXTS):
+            _yaml_account(text, rel, gen_off)
 
     # multi-line Java: setId(...) on one line, setLabel(...) on the next
     for base, path in files:
@@ -1275,12 +1410,15 @@ def load_offline_map(path):
             curie = parts[0].strip()
             label = parts[1].strip() if len(parts) > 1 else ""
             syns = [s for s in (parts[2].split("|") if len(parts) > 2 else []) if s]
+            # 4th column `obsolete` carries OLS4's is_obsolete flag, so the offline
+            # path can reach the OBSOLETE status the live path reads from the API.
+            retired = len(parts) > 3 and parts[3].strip().lower() == "obsolete"
             if label == "__NOTFOUND__":
                 m[curie] = ("NOTFOUND", "", [], "term-not-found")
             elif label == "__ERROR__":
                 m[curie] = ("ERROR", "", [], "simulated-lookup-failure")
             else:
-                m[curie] = ("FOUND", label, syns, "")
+                m[curie] = ("OBSOLETE" if retired else "FOUND", label, syns, "")
     return m
 
 
@@ -1307,7 +1445,7 @@ def _resolve_uncached(curie):
             return ("UNRESOLVED", "", [], "term-not-found-in-ols4")
         if hit[0] == "ERROR":
             return ("UNRESOLVED", "", [], "simulated-lookup-failure")
-        return ("FOUND", hit[1], hit[2], "offline-map")
+        return (hit[0], hit[1], hit[2], "offline-map")
     if NO_NETWORK:
         return ("UNRESOLVED", "", [], "network-disabled")
 
@@ -1382,21 +1520,94 @@ def _not_id_shape(curie):
 #   - another identifier: colon form, or PREFIX_digits with a prefix this tool knows
 #   - no letter in it at all
 #   - the identifier itself again, whatever the punctuation
-#   - the bare name of an ontology ("NCBITAXON")
+#   - the bare name of an ontology ("NCBITAXON"), one character ("P"), or a
+#     bare field word from the list below ("name", "subject", "evidence"),
+#     unless the ontology itself calls the term that (next point)
 #   - a lower-case word_with_underscores, BUT ONLY when the identifier resolves
 #     and its own label is not written that way. Sequence Ontology names are
 #     all of that form (missense_variant), and so are the three Gene Ontology
 #     roots. A first version set every such word aside and hid a wrong SO name;
 #     review caught it. Now the ontology decides: if the term's label or a
 #     synonym is itself word_with_underscores, the pair is judged.
-# A single plain word ("tissue" beside the id for lung) is NOT set aside: it
-# may be a wrong name, and that is the thing this tool is for.
+# THE ONTOLOGY DECIDES. The last three kinds above, and the underscore kind,
+# are set aside only when the term resolves and the text is NOT its label or
+# one of its synonyms. Real terms are labelled "HP", "Uberon" and "evidence";
+# written beside their own identifiers those are right and are judged OK.
+# A FIELD WORD IS A SPECIAL CASE, found in review: NCIT has terms really
+# called "Source" and "Subject", so "source" beside the identifier for Subject
+# is a genuine swap. A field word is therefore set aside only when NO term of
+# that ontology is labelled with it; if one is, or the ontology cannot be
+# asked, the pair is judged.
+# A single plain word that is not on the field list ("tissue" beside the id
+# for lung) is NOT set aside: it may be a wrong name, and that is the thing
+# this tool is for.
 _NOT_LABEL = []
 _SNAKE = re.compile(r"[a-z0-9]+(?:_[a-z0-9]+)+\Z")
 _ID_COLON = re.compile(RS_CURIE_RE + r"\Z")
 _ID_UNDER = re.compile(r"([A-Za-z]+)_[A-Za-z0-9]*\d[A-Za-z0-9]*\Z")
 _KNOWN_SPELLED = set(PREFIX_ONTOLOGY) | set(CURIE_PREFIX_ALIAS.values())
 _KNOWN_UPPER = {x.upper() for x in _KNOWN_SPELLED}
+# Words that name a field, in test fixtures and canned replies. Measured: 50
+# false mismatches in one Rust project were these beside an identifier.
+_FIELD_WORDS = frozenset(("name", "label", "id", "type", "object", "subject", "predicate",
+                          "category", "evidence", "value", "key", "description", "title",
+                          "text", "source", "target", "xrefs", "synonyms"))
+
+
+_CALLED = {}        # (ontology, word) -> True / False / None
+
+
+def _some_term_is_called(curie, word):
+    """Is ANY term of this identifier's ontology labelled exactly `word`?
+    True, False, or None when it cannot be asked (no network, a failed lookup)."""
+    prefix = curie.split(":", 1)[0].upper()
+    if prefix not in PREFIX_ONTOLOGY:
+        return None
+    ont = PREFIX_ONTOLOGY[prefix] or prefix.lower()
+    key = (ont, word.lower())
+    if key in _CALLED:
+        return _CALLED[key]
+    if os.environ.get("OTV_TEST_SEARCH_FAILS") == "1":
+        # Test hook only: the label search cannot be asked while term lookups
+        # still answer. Nothing else can reach that state offline.
+        ans = None
+    elif OFFLINE is not None:
+        ans = any(k.split(":", 1)[0].upper() == prefix and v[0] in ("FOUND", "OBSOLETE") and norm(v[1]) == norm(word)
+                  for k, v in OFFLINE.items())
+    elif NO_NETWORK:
+        ans = None
+    else:
+        url = "%s/search?%s" % (OLS_BASE, urllib.parse.urlencode({
+            "q": word, "ontology": ont, "exact": "true", "queryFields": "label",
+            "rows": "20", "fieldList": "label,type,obo_id"}))
+        _LOOKUPS[0] += 1
+        if _LOOKUPS[0] % 10 == 0:
+            time.sleep(0.4)
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "ontology-term-validate/%s" % VERSION})
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                docs = json.load(r)["response"]["docs"]
+            # Only a CLASS counts. Most ontologies import annotation properties
+            # called label, id, type, title, description and source; a word that
+            # only names a property cannot be the wrong name of a term.
+            # ... and only one of the ontology's OWN terms: MONDO imports a
+            # class called "object" from an upper ontology, which is not a disease.
+            own = CURIE_PREFIX_ALIAS.get(prefix, prefix).upper() + ":"
+            ans = any(d.get("type") == "class" and (d.get("obo_id") or "").upper().startswith(own)
+                      and norm(d.get("label") or "") == norm(word) for d in docs)
+        except Exception:
+            ans = None
+    _CALLED[key] = ans
+    return ans
+
+
+def _ontology_says(curie, s):
+    """-> True the term resolves and s is its label or a synonym; False it
+    resolves and s is neither; None it cannot be looked up."""
+    status, cur, syns, _d = resolve(curie)
+    if status == "UNRESOLVED":
+        return None
+    return any(norm(x) == norm(s) for x in [cur] + list(syns) if x)
 
 
 def _not_a_label(curie, s):
@@ -1410,12 +1621,27 @@ def _not_a_label(curie, s):
         return "no letters"
     if norm(s) in (norm(curie), norm(curie.partition(":")[2])):
         return "the identifier again"
+    kind = None
+    if s.lower() in _FIELD_WORDS and s == s.lower() and _some_term_is_called(curie, s) is not False:
+        # The ontology has a term really called this ("source", "subject" in
+        # NCIT), or it could not be asked. Then the word may be a wrong NAME,
+        # a swap of two real terms, and that is judged, never set aside.
+        return None
     if s.upper() in _KNOWN_UPPER:
-        return "an ontology's name"
-    if _SNAKE.match(s):
-        status, cur, syns, _d = resolve(curie)
-        if status != "UNRESOLVED" and not any(_SNAKE.match(x or "") for x in [cur] + list(syns)):
-            return "a code name"
+        kind = "an ontology's name"
+    elif len(s) == 1:
+        kind = "one character"
+    elif s.lower() in _FIELD_WORDS and s == s.lower():
+        kind = "a field name"
+    elif _SNAKE.match(s):
+        # Judge it when the ontology writes ITS label that way (Sequence
+        # Ontology, the Gene Ontology roots): then a wrong one is a wrong name.
+        status, cur, _syns, _d = resolve(curie)
+        if status == "UNRESOLVED" or _SNAKE.match(cur or ""):
+            return None
+        kind = "a code name"
+    if kind and _ontology_says(curie, s) is False:
+        return kind
     return None
 
 
@@ -1455,6 +1681,19 @@ if _unl:
     print("unlabelled ids : %d distinct identifier%s in script or Markdown with no label beside %s — NOT checked%s"
           % (_unl, "" if _unl == 1 else "s", "it" if _unl == 1 else "them",
              "" if len(SC_OCC) == _unl else " [%d occurrences]" % len(SC_OCC)))
+_unl = len({o[3] for o in YAML_OCC})
+if _unl:
+    print("unlabelled ids : %d distinct identifier%s in YAML with no label beside %s — NOT checked%s"
+          % (_unl, "" if _unl == 1 else "s", "it" if _unl == 1 else "them",
+             "" if len(YAML_OCC) == _unl else " [%d occurrences]" % len(YAML_OCC)))
+if LABEL_DEFERRED[0]:
+    print("label deferred to name: %d (a category-shaped label sat beside a name; the name was checked, the label was not)"
+          % LABEL_DEFERRED[0])
+if SKIPPED_DIRS:
+    print("skipped dirs   : %d director%s NOT read, holding files of a type this tool reads: %s%s"
+          % (len(SKIPPED_DIRS), "y" if len(SKIPPED_DIRS) == 1 else "ies",
+             ", ".join("%s (%d)" % d for d in SKIPPED_DIRS[:10]),
+             "" if len(SKIPPED_DIRS) <= 10 else ", ... %d more" % (len(SKIPPED_DIRS) - 10)))
 if _NOT_SHAPE:
     print("not id-shaped  : %d pair%s set aside -- lower-case unknown prefix and no digit in the local part (e.g. %s) -- NOT checked"
           % (len(_NOT_SHAPE), "" if len(_NOT_SHAPE) == 1 else "s",
@@ -1484,12 +1723,14 @@ if not pairs:
     write_json({"version": VERSION, "verdict": "EMPTY-SCAN", "pairs": [],
                 "counts": {"ok": 0, "synonym": 0, "mismatch": 0,
                            "unresolved": 0, "obsolete": 0,
-                           "not_identifier_shaped": len(_NOT_SHAPE), "not_a_label": len(_NOT_LABEL)},
+                           "not_identifier_shaped": len(_NOT_SHAPE), "not_a_label": len(_NOT_LABEL),
+                           "label_deferred_to_name": LABEL_DEFERRED[0]},
+                "skipped_dirs": [{"dir": d, "files": n} for d, n in SKIPPED_DIRS],
                 "not_a_label_pairs": [
                     {"curie": p[0], "written": p[1], "file": p[2], "line": p[3], "why": p[4]} for p in _NOT_LABEL],
                 "not_identifier_shaped_pairs": [
                     {"curie": p[0], "written": p[1], "file": p[2], "line": p[3]} for p in _NOT_SHAPE],
-                "rust_ids": RS_IDS, "script_ids": SC_IDS}, indent=2)
+                "rust_ids": RS_IDS, "script_ids": SC_IDS, "yaml_ids": YAML_IDS}, indent=2)
     print("VERDICT EMPTY-SCAN (UNKNOWABLE) — exit %d" % EXIT_EMPTY)
     sys.exit(EXIT_EMPTY)
 
@@ -1500,6 +1741,19 @@ for curie, label, rel, lineno, alt in pairs:
     def judge(written):
         if status == "UNRESOLVED":
             return "UNRESOLVED", detail
+        if status == "OBSOLETE":
+            # A retired term is read BEFORE the synonym branch, or a written name
+            # that is one of its synonyms reads SYNONYM and hides the retirement.
+            # OLS4 writes the label as "obsolete <name>"; the bare name, the label
+            # and every synonym are all the retired term's own names. A name that
+            # is none of them falls through and is judged (MISMATCH).
+            # Gated on OLS4's is_obsolete flag: a label that merely begins
+            # "obsolete " on a live term is a different name, and is judged.
+            own = [cur] + list(syns)
+            if re.match(r"obsolete\s", cur or "", re.I):
+                own.append(cur[len("obsolete"):])
+            if any(norm(x) == norm(written) for x in own if x):
+                return "OBSOLETE", detail
         if norm(cur) == norm(written):
             return ("OBSOLETE" if status == "OBSOLETE" else "OK"), detail
         if any(norm(s) == norm(written) for s in syns):
@@ -1570,12 +1824,14 @@ write_json({"version": VERSION, "verdict": verdict, "exit": code,
                        "mismatch": c["MISMATCH"],
                        "unresolved": c["UNRESOLVED"],
                        "obsolete": c["OBSOLETE"], "pairs": len(rows),
-                       "not_identifier_shaped": len(_NOT_SHAPE), "not_a_label": len(_NOT_LABEL)},
+                       "not_identifier_shaped": len(_NOT_SHAPE), "not_a_label": len(_NOT_LABEL),
+                           "label_deferred_to_name": LABEL_DEFERRED[0]},
+            "skipped_dirs": [{"dir": d, "files": n} for d, n in SKIPPED_DIRS],
             "not_a_label_pairs": [
                 {"curie": p[0], "written": p[1], "file": p[2], "line": p[3], "why": p[4]} for p in _NOT_LABEL],
             "not_identifier_shaped_pairs": [
                 {"curie": p[0], "written": p[1], "file": p[2], "line": p[3]} for p in _NOT_SHAPE],
-            "rust_ids": RS_IDS, "script_ids": SC_IDS,
+            "rust_ids": RS_IDS, "script_ids": SC_IDS, "yaml_ids": YAML_IDS,
             "rows": rows}, indent=2, sort_keys=True)
 print("VERDICT %s — exit %d" % (verdict, code))
 sys.exit(code)

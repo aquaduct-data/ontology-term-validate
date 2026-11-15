@@ -25,7 +25,7 @@ against [EBI OLS4](https://www.ebi.ac.uk/ols4), and classifies every pair:
 | `OK` | the written label matches the ontology's current label |
 | `SYNONYM` | matches an exact synonym rather than the primary label — reported distinctly, never folded into `OK` |
 | `MISMATCH` | the identifier resolves to a **different** term than the label claims |
-| `OBSOLETE` | resolves and matches, but the term is deprecated |
+| `OBSOLETE` | the ontology has retired the term, and what is written is its label, its former name or one of its synonyms |
 | `UNRESOLVED` | the lookup did not answer — **cannot determine**, not "clean" |
 
 ```console
@@ -78,6 +78,63 @@ reader, described below.
 
 Not opened at all: `.html`, `.vue`, `.svelte`. Terms kept only there give a
 clean-looking exit 3.
+
+Not read, but **counted**: build and dependency folders (`build`, `dist`,
+`target`, `node_modules`, `venv` and the like). When one of them holds files of
+a type this tool reads, the header says so
+(`skipped dirs : N directories NOT read …`) and `--json` lists them, so a
+project whose terms live in generated output is not reported as an empty or a
+clean scan without a word. Point the tool at such a folder directly to read it.
+
+### YAML
+
+```yaml
+nodes:
+  # a list item: the commonest layout
+  - id: HP:0001250
+    label: Seizure
+  # an id that is not the first key of its item
+  - alt_names: [Fits]
+    id: MONDO:0007947
+    label: Marfan syndrome
+# a plain mapping
+term:
+  id: "NCIT:C5189"
+  label: "Breast Extraskeletal Osteosarcoma"
+```
+
+An `id:` is paired with the `label:` in the **same mapping**: at the same
+column, within three lines, and never across the start of another list item.
+A double-quoted value has its escapes decoded (`"\u03B1-…"` is read as the
+Greek letter), and a comment after a quoted value is not part of it.
+
+The same accounting as for Rust applies to `.yaml` and `.yml` files: every
+identifier with a known prefix is found by a plain search of the text, and is
+either paired at that exact position or counted in the header
+(`unlabelled ids : N … in YAML … NOT checked`). The ends of a link
+(`source: HP:…`, `target: MONDO:…`) have no label beside them, so they are
+counted there and not judged.
+
+**Limits.** Flow mappings (`{id: HP:…, label: …}`) and a label more than three
+lines from its `id:` are not paired; they are counted as unlabelled. A comment
+after an *unquoted* value is read as part of the value.
+
+### A category beside a name
+
+Knowledge graphs often write three things beside an identifier:
+
+```json
+{"id": "CHEBI:3001", "label": "ChemicalSubstance", "name": "beclomethasone"}
+```
+
+Here `label` is the node's category, not the term's name. When a `label`
+is written like a class name (`ChemicalSubstance`, `Disease`, `Protein`) and a
+`name` sits beside it in the same object, the **name** is checked and the label
+is not. The tool says how often it did this
+(`label deferred to name: N` in the header, `label_deferred_to_name` in
+`--json`), because it is judging something other than the field called
+`label`. With no `name` beside it, the label is judged as written. This applies
+to JSON and to YAML.
 
 ### Rust
 
@@ -230,20 +287,41 @@ identifier written with a colon, in the first place; those show up under
   names (`missense_variant`) and the Gene Ontology roots are written with
   underscores, so those are judged like any other name. If the identifier
   cannot be looked up, the pair stays `UNRESOLVED`.
+- a single character
+- a lower-case **field word** — `name`, `label`, `id`, `type`, `object`,
+  `subject`, `predicate`, `category`, `evidence`, `value`, `key`,
+  `description`, `title`, `text`, `source`, `target`, `xrefs`, `synonyms` —
+  **but only when no term of that identifier's ontology is called that word.**
+  The tool asks the lookup service once per word and ontology. NCIT has terms
+  called *Source* and *Subject*, so beside an NCIT identifier those two words
+  are judged, and a swap of the two is reported. If the question cannot be
+  asked, the pair is judged.
 
-A single plain word is **still judged**: `"tissue"` beside the identifier for
-lung is reported, because it may be a wrong name. That means test code can
-still produce false mismatches from words such as `name` or `object`. Read a
-mismatch in a test file before acting on it.
+Every other single plain word is **still judged**: `"tissue"` beside the
+identifier for lung is reported, because it may be a wrong name.
 
-Measured on twelve public projects: 72 mismatches reported before this rule,
-22 after, and every one of the 15 real ones kept.
+**What this can hide.** The field-word check asks whether a term of the
+identifier's *own* ontology has that name. A field word that is the real name
+of a term in a *different* ontology, written beside the wrong identifier, is
+set aside and not reported as a mismatch. It is not silent: it is counted in
+the header and listed in the JSON report under `not_a_label_pairs`. **Read
+that list** when the count is not zero. A word written with a capital
+(`Source`) is always judged.
+
+Measured on twelve public projects with the first five kinds: 72 mismatches
+reported before, 22 after, and every one of the 15 real ones kept. The last
+two kinds (single character, field word) were measured on six of those
+projects: one went from 50 to 27 and one from 3 to 0, the other four did not
+change, and every real one was kept.
 
 ## Options
 
 ```
---json <file>            also write a machine-readable report (includes the unlabelled counts)
+--json <file>            also write a machine-readable report (includes the unlabelled counts,
+                         skipped folders and the deferral count)
 --offline-map <file>     resolve from a local TSV instead of the network
+                         (identifier, label, synonyms separated by |, and optionally
+                         the word obsolete in a fourth column)
 --no-network             make every lookup fail, to prove fail-closed behaviour
 --tolerate-unresolved    downgrade exit 4 to 0; pairs are still printed as UNRESOLVED
 --timeout <seconds>      per-request timeout (default 25)
@@ -275,14 +353,24 @@ run; if a lookup did not answer, you do not know.
   cannot-determine, not as a pass.
 - **It needs the network**, unless you give it `--offline-map`.
 
+## A retired term
+
+A term the ontology has retired reads `OBSOLETE` only when the lookup service
+flags it as obsolete; a label that merely begins with the word "obsolete" is
+not enough. For a flagged term, its label, its former name (the label without
+the leading "obsolete ") and any of its synonyms all read `OBSOLETE`, so a
+retired term written by an old synonym is not passed as a live `SYNONYM`. Any
+other text beside it is a `MISMATCH`.
+
 ## Testing
 
 ```bash
 ./ontology-term-validate-selftest.sh
 ```
 
-129 cases, hermetic by default via `--offline-map`, plus live lookups when the
-network is available. Every classification has a case that **plants the defect
+170 cases: 166 run offline against a fixed map (`--offline-map`) and 4 make
+live lookups when the network is available. One of the offline cases runs the
+YAML sample above exactly as printed. Every classification has a case that **plants the defect
 and requires the tool to report it**, so a passing suite means the detector
 still bites.
 

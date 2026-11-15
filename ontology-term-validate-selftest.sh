@@ -119,8 +119,19 @@ NCIT:C51899	Radical Cystoprostatectomy	Cystoprostatectomy|Radical Cystoprostatec
 NCIT:C5189	Breast Extraskeletal Osteosarcoma	Breast Osteosarcoma
 MONDO:0007947	Marfan syndrome	MFS
 NCIT:C99999999	__NOTFOUND__
+ENVO:00002006	liquid water
+FOODON:03315426	yeast extract
 SO:0001583	missense_variant
 GO:0008150	biological_process
+HP:0000006	Autosomal dominant inheritance	monoallelic_autosomal
+OMIT:0032682	HP
+NCIT:C48910	Subject
+NCIT:C25683	Source
+NCIT:C190111	Uberon
+ECO:0000000	evidence
+GO:0003674	molecular_function	F
+GO:0016575	obsolete histone deacetylation		obsolete
+GO:0006915	apoptotic process
 M
 
 # Report the tool path repo-relative: committed transcripts must carry no host paths.
@@ -885,13 +896,43 @@ wcase lx_w_unclosed 1 1        # after a string that never closes, the rest of t
 wcase lx_w_unclosed_raw 1 1    # the same for a raw string
 wcase lx_w_field 1 0           # the struct-field reader's pair is PAIRED
 wcase lx_w_field_twice 2 1     # ...and a second use of that identifier on the same line is NOT
+# Three planted faults that once survived the suite, each red on its fault now:
+accfx lx_w_rawid <<'R'
+fn a() { let t = f(r#"HP:0001250"#, "Seizure"); }
+R
+accfx lx_w_rawid_after <<'R'
+fn a() { let t = f("Seizure", r##"HP:0001250"##); }
+R
+accfx lx_w_rawid_table <<'R'
+const T: &[(&str, &str)] = &[
+    (r#"HP:0001250"#, "Seizure"),
+    (r"MONDO:0007947", "Marfan syndrome"),
+];
+R
+accfx lx_w_us_tail <<'R'
+fn a() { let s = "HP_0001250_label"; }
+R
+accfx lx_w_continued <<'R'
+fn a() { let t = f("HP:0001\
+    250", "Seizure"); }
+R
+wcase lx_w_rawid 1 0           # an identifier that is the whole of a raw string, paired by a chain reader
+wcase lx_w_rawid_after 1 0     # the same, label first and two hashes
+wcase lx_w_rawid_table 2 0     # the same in a table, one and no hashes
+wcase lx_w_us_tail 1 1         # an underscore AFTER the underscore spelling does not hide it either
+wcase lx_w_continued 1 0       # an identifier broken by a backslash-newline is judged, so it is PAIRED
+run_tool --offline-map "${MAP}" "${WORK}/lx_w_continued"; rc=$?
+if [ $rc -eq 0 ] && has "${WORK}/out" "ok=1" && hasnt "${WORK}/out" "unlabelled ids"; then
+  ok "accounting: an identifier continued over a line break is judged once and not also printed as a cut-off unchecked one"
+else bad "accounting: a continued identifier should be ok=1 with no unlabelled line (got exit ${rc})" "${WORK}/out"; fi
 if [ ${W_BAD} -eq 0 ]; then
-  ok "accounting: fifteen shapes outside raw strings each give the stated count (plain, byte, C, comments, underscore, PURL, joined, unclosed, struct fields)"
+  ok "accounting: twenty shapes each give the stated count (plain, byte, C, comments, underscore, PURL, joined, unclosed, struct fields, whole-value raw identifiers, a continued identifier)"
 else bad "accounting: ${W_BAD} whole-file case(s) gave a different count"; fi
 # A paired identifier is PAIRED and nothing else: one right pair, one occurrence, none unchecked.
 accfx lx_w_pair <<'R'
 fn a() { f("HP:0001250", "Seizure"); }
 R
+W_BAD=0     # its own count: a failure above must not read as a second failure here
 wcase lx_w_pair 1 0
 if [ ${W_BAD} -eq 0 ]; then ok "accounting: a paired identifier is counted once, as paired"
 else bad "accounting: a plain right pair was miscounted"; fi
@@ -1268,7 +1309,7 @@ done
 # ── not a label ──────────────────────────────────────────────────────────────
 # Measured on twelve real projects: 50 of 72 reported mismatches were two
 # strings side by side in test code where the second was never a name.
-for d in nl_ids nl_num nl_snake nl_again nl_word nl_mixed nl_rust nl_so_ok nl_so_bad nl_go_bad nl_judged nl_prefix nl_unres; do mkdir -p "${WORK}/${d}"; done
+for d in nl_ids nl_num nl_snake nl_again nl_word nl_mixed nl_rust nl_so_ok nl_so_bad nl_go_bad nl_judged nl_prefix nl_unres nl_syn nl_real nl_field nl_anchor nl_fieldun nl_swap nl_uberon; do mkdir -p "${WORK}/${d}"; done
 cat > "${WORK}/nl_ids/t.py" <<'T'
 pairs = [("NCIT:C5189", "HP:0001250"), ("NCIT:C5189", "MONDO_0007947")]
 T
@@ -1310,7 +1351,7 @@ T
 # starts with a code name, a non-ASCII letter, the local number inside a phrase,
 # a word_number whose prefix is not an ontology's.
 cat > "${WORK}/nl_judged/t.py" <<'T'
-v = [("NCIT:C5189", "SEIZURE_DISORDER_TYPE"), ("NCIT:C5189", "cell_type of neuron"), ("NCIT:C5189", "δ"),
+v = [("NCIT:C5189", "SEIZURE_DISORDER_TYPE"), ("NCIT:C5189", "cell_type of neuron"), ("NCIT:C5189", "δ-cell"),
      ("NCIT:C5189", "Tumour type C5189 variant"), ("NCIT:C5189", "Grade_3")]
 T
 cat > "${WORK}/nl_prefix/t.py" <<'T'
@@ -1321,6 +1362,45 @@ T
 cat > "${WORK}/nl_unres/t.py" <<'T'
 v = [("NCIT:C99999999", "is_marker_for")]
 T
+# From the second review and a second batch of real projects.
+# A term with ONE underscore synonym does not make every code name beside it a name...
+cat > "${WORK}/nl_syn/t.py" <<'T'
+v = [("HP:0000006", "has_inheritance")]
+T
+# ...but the synonym itself, and real labels that look like a prefix, a field word or one letter, are right.
+cat > "${WORK}/nl_real/t.py" <<'T'
+v = [("HP:0000006", "monoallelic_autosomal"), ("OMIT:0032682", "HP"), ("ECO:0000000", "evidence"), ("GO:0003674", "F")]
+T
+cat > "${WORK}/nl_field/t.py" <<'T'
+v = [("NCIT:C5189", "name"), ("NCIT:C5189", "category"), ("NCIT:C5189", "P"), ("NCIT:C5189", "Name"),
+     ("NCIT:C5189", "evidence")]   # a term is called "evidence", but in another ontology
+T
+# An identifier followed by more words is a phrase, and word_word with no digit is not an identifier.
+cat > "${WORK}/nl_anchor/t.py" <<'T'
+v = [("NCIT:C5189", "HP:0001251 ataxia"), ("NCIT:C5189", "GO_fast")]
+T
+cat > "${WORK}/nl_fieldun/t.py" <<'T'
+v = [("NCIT:C99999999", "name")]
+T
+# Found in review: two real terms swapped, written in lower case, must be caught.
+cat > "${WORK}/nl_swap/t.py" <<'T'
+v = [("NCIT:C48910", "source"), ("NCIT:C25683", "subject"), ("NCIT:C48910", "name")]
+T
+cat > "${WORK}/nl_uberon/t.py" <<'T'
+v = [("NCIT:C190111", "Uberon")]
+T
+expect 1 nl_swap    "not a label: a swap of two real terms that are field words is a MISMATCH; a field word no term is called is set aside" "mismatch=2" "not a label    : 1 pair" "a field name"
+# When the label search cannot be asked, a field word is JUDGED (noise), never hidden.
+OTV_TEST_SEARCH_FAILS=1 "${TOOL}" --offline-map "${MAP}" "${WORK}/nl_field" > "${WORK}/out" 2>&1; rc=$?
+if [ $rc -eq 1 ] && has "${WORK}/out" "mismatch=4" && has "${WORK}/out" "not a label    : 1 pair" && has "${WORK}/out" "one character"; then
+  ok "not a label: if the ontology cannot be asked about a field word, the pair is judged, not set aside"
+else bad "not a label: an unanswerable search should judge field words (got exit ${rc})" "${WORK}/out"; fi
+expect 0 nl_uberon  "not a label: a term really labelled like an ontology's name is right" "ok=1" '!not a label'
+expect 3 nl_syn     "not a label: a code name beside a term that merely HAS an underscore synonym is set aside" "not a label    : 1 pair" "a code name"
+expect 0 nl_real    "not a label: a synonym with underscores, and labels that are HP, evidence or one letter, are right names" "ok=2" "synonym=2" '!not a label'
+expect 1 nl_field   "not a label: bare field words and one letter are set aside; a capitalised word is judged" "not a label    : 4 pairs" "a field name" "one character" "mismatch=1" "written='Name'"
+expect 1 nl_anchor  "not a label: an identifier followed by words, and word_word without a digit, are judged" "mismatch=2" '!not a label'
+expect 4 nl_fieldun "not a label: a field word beside an identifier that cannot be looked up stays UNRESOLVED" "unresolved=1" '!not a label'
 expect 0 nl_so_ok  "not a label: missense_variant and biological_process are real names and are judged right" "ok=2" '!not a label'
 expect 1 nl_so_bad "not a label: a wrong Sequence Ontology name is a MISMATCH, not set aside" "mismatch=1" '!not a label'
 expect 1 nl_go_bad "not a label: a wrong Gene Ontology root is a MISMATCH, not set aside" "mismatch=1" '!not a label'
@@ -1353,6 +1433,353 @@ PYE
 then ok "not a label: an empty scan still says how many were set aside, and the JSON says why"
 else bad "not a label: the empty-scan report lost the set-aside pairs" "${WORK}/out"; fi
 
+# ── food and environment prefixes ────────────────────────────────────────────
+mkdir -p "${WORK}/env_ok" "${WORK}/env_bad"
+cat > "${WORK}/env_ok/m.yaml" <<'Y'
+ingredients:
+- term:
+    id: FOODON:03315426
+    label: yeast extract
+- term:
+    id: ENVO:00002006
+    label: liquid water
+Y
+cat > "${WORK}/env_bad/m.yaml" <<'Y'
+ingredients:
+- term:
+    id: ENVO:00002006
+    label: yeast extract
+Y
+expect 0 env_ok  "prefixes: FOODON and ENVO terms are judged, not left as unknown prefixes" "ok=2" '!unknown-prefix'
+expect 1 env_bad "prefixes: a wrong name beside an ENVO identifier is a MISMATCH" "mismatch=1"
+
+# ── JSON label beside name, skipped dirs, retired terms ──────────────────────
+# Fixtures are synthetic.
+mkdir -p "${WORK}/j88_ok" "${WORK}/j88_bad" "${WORK}/j88_only" "${WORK}/j88_skip/build/site" "${WORK}/j88_skip/node_modules/x" "${WORK}/j88_skip/src" "${WORK}/j88_obs" "${WORK}/j88_obsbad"
+cat > "${WORK}/j88_ok/n.json" <<'J'
+{"nodes": [{"id": "HP:0001250", "label": "PhenotypicFeature", "name": "Seizure"}]}
+J
+cat > "${WORK}/j88_bad/n.json" <<'J'
+{"nodes": [{"id": "HP:0001250", "label": "PhenotypicFeature", "name": "Marfan syndrome"}]}
+J
+cat > "${WORK}/j88_only/n.json" <<'J'
+{"nodes": [{"id": "HP:0001250", "label": "Marfan syndrome"}]}
+J
+cat > "${WORK}/j88_skip/build/site/t.json" <<'J'
+{"id": "HP:0001250", "label": "Seizure"}
+J
+cp "${WORK}/j88_skip/build/site/t.json" "${WORK}/j88_skip/node_modules/x/t.json"
+cat > "${WORK}/j88_skip/src/ok.json" <<'J'
+{"id": "HP:0001250", "label": "Seizure"}
+J
+cat > "${WORK}/j88_obs/n.json" <<'J'
+{"id": "GO:0016575", "label": "histone deacetylation"}
+J
+cat > "${WORK}/j88_obsbad/n.json" <<'J'
+{"id": "GO:0016575", "label": "apoptotic process"}
+J
+
+run_tool --offline-map "${MAP}" "${WORK}/j88_ok"; rc=$?
+if [ $rc -eq 0 ] && has "${WORK}/out" "ok=1 " && has "${WORK}/out" "mismatch=0"; then
+  ok "name over label: JSON right name + category label -> OK (name checked, category ignored)"
+else bad "name over label: right name + category label should read OK (got exit ${rc})" "${WORK}/out"; fi
+run_tool --offline-map "${MAP}" "${WORK}/j88_bad"; rc=$?
+if [ $rc -eq 1 ] && has "${WORK}/out" "mismatch=1" && has "${WORK}/out" "written='Marfan syndrome'"; then
+  ok "name over label: JSON wrong name + category label -> MISMATCH on the name"
+else bad "name over label: wrong name should read MISMATCH on the name (got exit ${rc})" "${WORK}/out"; fi
+run_tool --offline-map "${MAP}" "${WORK}/j88_only"; rc=$?
+if [ $rc -eq 1 ] && has "${WORK}/out" "written='Marfan syndrome'"; then
+  ok "name over label: JSON object with only label -> label checked, as before"
+else bad "name over label: label-only object should be checked as before (got exit ${rc})" "${WORK}/out"; fi
+
+run_tool --offline-map "${MAP}" "${WORK}/j88_skip"; rc=$?
+if [ $rc -eq 0 ] && has "${WORK}/out" "skipped dirs   : 2 directories NOT read" \
+   && has "${WORK}/out" "build (1)" && has "${WORK}/out" "node_modules (1)" && has "${WORK}/out" "files read     : 1"; then
+  ok "skipped dirs: skipped build/ and node_modules/ are named with counts and still not read"
+else bad "skipped dirs: skipped dirs should be named, counted, not read (got exit ${rc})" "${WORK}/out"; fi
+run_tool --offline-map "${MAP}" "${WORK}/j88_ok"
+if hasnt "${WORK}/out" "skipped dirs"; then ok "skipped dirs: no skipped-dirs line when nothing readable was skipped (control)"
+else bad "skipped dirs: skipped-dirs line printed with nothing skipped" "${WORK}/out"; fi
+
+run_tool --offline-map "${MAP}" "${WORK}/j88_obs"; rc=$?
+if [ $rc -eq 0 ] && has "${WORK}/out" "obsolete=1" && has "${WORK}/out" "mismatch=0"; then
+  ok "retired term: retired term ('obsolete ' + written name) -> OBSOLETE, not MISMATCH"
+else bad "retired term: retired term with matching name should read OBSOLETE (got exit ${rc})" "${WORK}/out"; fi
+run_tool --offline-map "${MAP}" "${WORK}/j88_obsbad"; rc=$?
+if [ $rc -eq 1 ] && has "${WORK}/out" "mismatch=1" && has "${WORK}/out" "obsolete=0"; then
+  ok "retired term: retired term with a DIFFERENT name still MISMATCH (control)"
+else bad "retired term: retired term with a different name must stay MISMATCH (got exit ${rc})" "${WORK}/out"; fi
+
+
+# ── Deferral count, the obsolete flag, YAML names, retired synonyms ──────────
+# Fixtures are synthetic. jcount <report.json> <key> prints counts[key] or MISSING.
+jcount() { python3 -c '
+import json, sys
+try: print(json.load(open(sys.argv[1]))["counts"].get(sys.argv[2], "MISSING"))
+except Exception as e: print("UNREADABLE")' "$1" "$2"; }
+
+# A label that gave way to the name beside it is SAID, in text and in --json.
+mkdir -p "${WORK}/j91_def" "${WORK}/j91_none"
+cat > "${WORK}/j91_def/n.json" <<'J'
+{"nodes": [{"id": "HP:0001250", "label": "Ataxia", "name": "Seizure"}]}
+J
+cat > "${WORK}/j91_none/n.json" <<'J'
+{"nodes": [{"id": "HP:0001250", "label": "Seizure"}]}
+J
+run_tool --offline-map "${MAP}" --json "${WORK}/j91_def.json" "${WORK}/j91_def"; rc=$?
+if [ $rc -eq 0 ] && has "${WORK}/out" "label deferred to name: 1" && [ "$(jcount "${WORK}/j91_def.json" label_deferred_to_name)" = "1" ]; then
+  ok "deferral: wrong one-word label beside a right name -> OK, and the deferral is printed and in --json (1)"
+else bad "deferral: deferral should be printed and counted in --json (got exit ${rc})" "${WORK}/out"; fi
+run_tool --offline-map "${MAP}" --json "${WORK}/j91_none.json" "${WORK}/j91_none"; rc=$?
+if [ $rc -eq 0 ] && hasnt "${WORK}/out" "label deferred to name" && [ "$(jcount "${WORK}/j91_none.json" label_deferred_to_name)" = "0" ]; then
+  ok "deferral: no name beside the label -> no deferral line, --json count 0 (control)"
+else bad "deferral: nothing deferred must print nothing and count 0 (got exit ${rc})" "${WORK}/out"; fi
+
+# A deferral is counted only where a pair is made: a node whose id is not a CURIE
+# is never checked, so a category label beside a name there defers nothing.
+mkdir -p "${WORK}/j91_nocurie"
+cat > "${WORK}/j91_nocurie/n.json" <<'J'
+{"nodes": [{"id": "not-a-curie", "label": "Drug", "name": "thing"}, {"id": "HP:0001250", "label": "Seizure"}]}
+J
+run_tool --offline-map "${MAP}" --json "${WORK}/j91_nocurie.json" "${WORK}/j91_nocurie"; rc=$?
+if [ $rc -eq 0 ] && has "${WORK}/out" "pairs=1" && hasnt "${WORK}/out" "label deferred to name" && [ "$(jcount "${WORK}/j91_nocurie.json" label_deferred_to_name)" = "0" ]; then
+  ok "deferral: non-CURIE id + category label + name -> not checked, so no deferral line and --json count 0"
+else bad "deferral: an unchecked node must not count as a deferral (got exit ${rc})" "${WORK}/out"; fi
+
+# OBSOLETE needs OLS4's obsolete FLAG, not just an "obsolete " label prefix.
+# The offline map carries the flag in an optional 4th column reading `obsolete`.
+M91="${WORK}/m91.tsv"
+printf 'GO:9100001\tobsolete live-looking name\t\n' > "${M91}"               # prefix, NO flag
+printf 'GO:9100002\tretired without prefix\t\tobsolete\n' >> "${M91}"        # flag, no prefix
+mkdir -p "${WORK}/j91_noflag" "${WORK}/j91_flag"
+cat > "${WORK}/j91_noflag/n.json" <<'J'
+{"id": "GO:9100001", "label": "live-looking name"}
+J
+cat > "${WORK}/j91_flag/n.json" <<'J'
+{"id": "GO:9100002", "label": "retired without prefix"}
+J
+run_tool --offline-map "${M91}" "${WORK}/j91_noflag"; rc=$?
+if [ $rc -eq 1 ] && has "${WORK}/out" "mismatch=1" && has "${WORK}/out" "obsolete=0"; then
+  ok "obsolete flag: 'obsolete ' label prefix WITHOUT the obsolete flag -> MISMATCH, not OBSOLETE"
+else bad "obsolete flag: prefix without the flag must not read OBSOLETE (got exit ${rc})" "${WORK}/out"; fi
+run_tool --offline-map "${M91}" "${WORK}/j91_flag"; rc=$?
+if [ $rc -eq 0 ] && has "${WORK}/out" "obsolete=1" && has "${WORK}/out" "mismatch=0"; then
+  ok "obsolete flag: obsolete FLAG carried by the offline map -> OBSOLETE (flag reached, no prefix needed)"
+else bad "obsolete flag: the flagged term must read OBSOLETE (got exit ${rc})" "${WORK}/out"; fi
+
+# Name-over-label for YAML too (plain id/label/name keys at one indent; the `- id:` list
+# layout has its own cases below).
+mkdir -p "${WORK}/y91_ok" "${WORK}/y91_bad" "${WORK}/y91_only" "${WORK}/y91_two"
+cat > "${WORK}/y91_ok/p.yaml" <<'Y'
+node:
+  id: HP:0001250
+  label: PhenotypicFeature
+  name: Seizure
+Y
+cat > "${WORK}/y91_bad/p.yaml" <<'Y'
+node:
+  id: HP:0001250
+  label: PhenotypicFeature
+  name: Marfan syndrome
+Y
+cat > "${WORK}/y91_only/p.yaml" <<'Y'
+node:
+  id: HP:0001250
+  label: Marfan syndrome
+Y
+cat > "${WORK}/y91_two/p.yaml" <<'Y'
+first:
+  id: HP:0001250
+  label: PhenotypicFeature
+  name: Seizure
+second:
+  id: HP:0000006
+  label: Disease
+  name: Autosomal dominant inheritance
+Y
+run_tool --offline-map "${MAP}" --json "${WORK}/y91_ok.json" "${WORK}/y91_ok"; rc=$?
+if [ $rc -eq 0 ] && has "${WORK}/out" "mismatch=0" && has "${WORK}/out" "label deferred to name: 1" && [ "$(jcount "${WORK}/y91_ok.json" label_deferred_to_name)" = "1" ]; then
+  ok "YAML name: YAML right name + category label -> OK (name checked), deferral counted"
+else bad "YAML name: YAML right name + category label should read OK (got exit ${rc})" "${WORK}/out"; fi
+run_tool --offline-map "${MAP}" "${WORK}/y91_bad"; rc=$?
+if [ $rc -eq 1 ] && has "${WORK}/out" "mismatch=1" && has "${WORK}/out" "written='Marfan syndrome'"; then
+  ok "YAML name: YAML wrong name + category label -> MISMATCH on the name"
+else bad "YAML name: YAML wrong name should read MISMATCH on the name (got exit ${rc})" "${WORK}/out"; fi
+run_tool --offline-map "${MAP}" "${WORK}/y91_only"; rc=$?
+if [ $rc -eq 1 ] && has "${WORK}/out" "written='Marfan syndrome'" && hasnt "${WORK}/out" "label deferred to name"; then
+  ok "YAML name: YAML with only a label -> label checked, as before (control)"
+else bad "YAML name: YAML label-only should be checked as before (got exit ${rc})" "${WORK}/out"; fi
+run_tool --offline-map "${MAP}" "${WORK}/y91_two"; rc=$?
+if [ $rc -eq 0 ] && has "${WORK}/out" "ok=2 " && has "${WORK}/out" "label deferred to name: 2"; then
+  ok "YAML name: two neighbouring YAML mappings each take their OWN name (no borrowing across ids)"
+else bad "YAML name: neighbouring nodes must not borrow each other's name (got exit ${rc})" "${WORK}/out"; fi
+
+# A retired term whose written name is one of its SYNONYMS reads OBSOLETE, not
+# SYNONYM (the synonym branch used to run first). Real cases: GO:0033387, GO:0046323,
+# GO:0070997. Labels and synonyms below are synthetic stand-ins; no network, offline map.
+M914="${WORK}/m914.tsv"
+printf 'GO:0033387\tobsolete retired term one\tretired one synonym\tobsolete\n' > "${M914}"
+printf 'GO:0046323\tobsolete retired term two\tretired two synonym|second two synonym\tobsolete\n' >> "${M914}"
+printf 'GO:0070997\tobsolete retired term three\tretired three synonym\tobsolete\n' >> "${M914}"
+printf 'GO:9140001\tlive term\tlive synonym\n' >> "${M914}"
+mkdir -p "${WORK}/j914_syn" "${WORK}/j914_other" "${WORK}/j914_live"
+cat > "${WORK}/j914_syn/n.json" <<'J'
+[{"id": "GO:0033387", "label": "retired one synonym"},
+ {"id": "GO:0046323", "label": "retired two synonym"},
+ {"id": "GO:0046323", "label": "second two synonym"},
+ {"id": "GO:0070997", "label": "retired three synonym"}]
+J
+cat > "${WORK}/j914_other/n.json" <<'J'
+{"id": "GO:0033387", "label": "something unrelated"}
+J
+cat > "${WORK}/j914_live/n.json" <<'J'
+{"id": "GO:9140001", "label": "live synonym"}
+J
+run_tool --offline-map "${M914}" --json "${WORK}/j914.json" "${WORK}/j914_syn"; rc=$?
+if [ $rc -eq 0 ] && has "${WORK}/out" "obsolete=4" && has "${WORK}/out" "synonym=0" && has "${WORK}/out" "mismatch=0"; then
+  ok "retired term: retired terms written by a SYNONYM (GO:0033387, GO:0046323 twice, GO:0070997) -> OBSOLETE x4, not SYNONYM"
+else bad "retired term: retired term written by a synonym must read OBSOLETE (got exit ${rc})" "${WORK}/out"; fi
+run_tool --offline-map "${M914}" "${WORK}/j914_other"; rc=$?
+if [ $rc -eq 1 ] && has "${WORK}/out" "mismatch=1" && has "${WORK}/out" "obsolete=0"; then
+  ok "retired term: retired term written by an unrelated name -> MISMATCH (control)"
+else bad "retired term: retired term with an unrelated name must stay MISMATCH (got exit ${rc})" "${WORK}/out"; fi
+run_tool --offline-map "${M914}" "${WORK}/j914_live"; rc=$?
+if [ $rc -eq 0 ] && has "${WORK}/out" "synonym=1" && has "${WORK}/out" "obsolete=0"; then
+  ok "retired term: a LIVE term written by its synonym still reads SYNONYM (control)"
+else bad "retired term: live term + synonym must still read SYNONYM (got exit ${rc})" "${WORK}/out"; fi
+
+# YAML list items. Found on a real file: a public knowledge graph's source writes every node as
+# `-   id: X` (32,783 lines) and the reader took only a line that STARTS with `id:` (225).
+# The other 99% were neither judged nor counted. Each case below is a shape from that
+# file or its obvious neighbour; yids prints "occurrences paired unchecked".
+yfx() { mkdir -p "${WORK}/$1"; cat > "${WORK}/$1/p.yaml"; }
+yids() { python3 -c '
+import json, sys
+try:
+    j = json.load(open(sys.argv[1]))["yaml_ids"]; print(j["occurrences"], j["paired"], j["unchecked"])
+except Exception as e: print("UNREADABLE")' "$1"; }
+yfx ylist_ok <<'Y'
+nodes:
+    -   id: HP:0001250
+        label: Seizure
+    -   id: MONDO:0007947
+        label: Marfan syndrome
+Y
+yfx ylist_bad <<'Y'
+nodes:
+  - id: HP:0001250
+    label: Marfan syndrome
+  - id: MONDO:0007947
+    label: Seizure
+Y
+yfx ylist_name <<'Y'
+nodes:
+    -   id: HP:0001250
+        label: PhenotypicFeature
+        name: Seizure
+    -   alt_names:
+        - Fits
+        id: MONDO:0007947
+        label: Disease
+        name: Seizure
+links:
+    -   key: has phenotype
+        source: MONDO:0007947
+        target: HP:0001250
+Y
+yfx ylist_noborrow <<'Y'
+items:
+  - id: HP:0001250
+  - label: Marfan syndrome
+    id: MONDO:0007947
+  - id: HP:0001250
+    note: x
+  - name: Marfan syndrome
+Y
+yfx ylist_quoted <<'Y'
+a:
+  - id: HP:0001250
+    label: "Seizure"
+  - id: MONDO:0007947
+    label: "Marfan syndrome"   # a note
+  - id: HP:0000006
+    label: 'Autosomal dominant inheritance'  # another
+Y
+yfx ylist_flow <<'Y'
+a:
+  - {id: HP:0001250, label: Marfan syndrome}
+b: [MONDO:0007947]
+Y
+# From review: nothing is taken from ABOVE an id that opens a list item, and going up stops
+# at the item's own first key. Each was right and untested; each is red on its planted fault.
+yfx ylist_up_opener <<'Y'
+items:
+  - id: HP:0001250
+    label: Seizure
+  - id: MONDO:0007947
+Y
+yfx ylist_up_firstkey <<'Y'
+items:
+  - label: Seizure
+  - name: x
+    id: MONDO:0007947
+Y
+yfx ylist_docs <<'Y'
+id: HP:0001250
+label: Seizure
+---
+id: MONDO:0007947
+Y
+run_tool --offline-map "${MAP}" --json "${WORK}/ylist.json" "${WORK}/ylist_up_opener"; rc=$?
+if [ $rc -eq 0 ] && has "${WORK}/out" "pairs=1" && has "${WORK}/out" "mismatch=0" && [ "$(yids "${WORK}/ylist.json")" = "2 1 1" ]; then
+  ok "YAML list: an id that opens a list item takes no label from the item above it"
+else bad "YAML list: an opening id borrowed the previous item's label (got exit ${rc}, yaml_ids $(yids "${WORK}/ylist.json"))" "${WORK}/out"; fi
+run_tool --offline-map "${MAP}" --json "${WORK}/ylist.json" "${WORK}/ylist_up_firstkey"; rc=$?
+if [ $rc -eq 3 ] && has "${WORK}/out" "pairs=0" && [ "$(yids "${WORK}/ylist.json")" = "1 0 1" ]; then
+  ok "YAML list: going up from an id stops at its own item's first key"
+else bad "YAML list: an id reached past its item's first key for a label (got exit ${rc}, yaml_ids $(yids "${WORK}/ylist.json"))" "${WORK}/out"; fi
+run_tool --offline-map "${MAP}" --json "${WORK}/ylist.json" "${WORK}/ylist_docs"; rc=$?
+if [ $rc -eq 0 ] && has "${WORK}/out" "pairs=1" && has "${WORK}/out" "mismatch=0" && [ "$(yids "${WORK}/ylist.json")" = "2 1 1" ]; then
+  ok "YAML list: a label is not borrowed across a YAML document separator"
+else bad "YAML list: a label crossed a --- separator (got exit ${rc}, yaml_ids $(yids "${WORK}/ylist.json"))" "${WORK}/out"; fi
+run_tool --offline-map "${MAP}" --json "${WORK}/ylist.json" "${WORK}/ylist_ok"; rc=$?
+if [ $rc -eq 0 ] && has "${WORK}/out" "ok=2 " && has "${WORK}/out" "pairs=2" && [ "$(yids "${WORK}/ylist.json")" = "2 2 0" ]; then
+  ok "YAML list: YAML list items (- id: / label:) are read -> ok=2 pairs=2, both counted as paired"
+else bad "YAML list: YAML list items should read ok=2 pairs=2 (got exit ${rc}, yaml_ids $(yids "${WORK}/ylist.json"))" "${WORK}/out"; fi
+expect 1 ylist_bad "YAML list: YAML list items with swapped labels -> both reported (mismatch=2)" "mismatch=2" "written='Marfan syndrome'" "written='Seizure'"
+run_tool --offline-map "${MAP}" --json "${WORK}/ylist.json" "${WORK}/ylist_name"; rc=$?
+if [ $rc -eq 1 ] && has "${WORK}/out" "ok=1 " && has "${WORK}/out" "mismatch=1" && has "${WORK}/out" "label deferred to name: 2" \
+   && has "${WORK}/out" "unlabelled ids : 2 distinct identifiers in YAML with no label beside them" && [ "$(yids "${WORK}/ylist.json")" = "4 2 2" ]; then
+  ok "YAML list: list item with a category label and a name -> the name is judged; an id after a nested list is still read; link ends are counted NOT checked"
+else bad "YAML list: list item name-over-label should be ok=1 mismatch=1, 4 occurrences 2 unchecked (got exit ${rc}, yaml_ids $(yids "${WORK}/ylist.json"))" "${WORK}/out"; fi
+run_tool --offline-map "${MAP}" --json "${WORK}/ylist.json" "${WORK}/ylist_noborrow"; rc=$?
+if [ $rc -eq 0 ] && has "${WORK}/out" "ok=1 " && has "${WORK}/out" "pairs=1" && [ "$(yids "${WORK}/ylist.json")" = "3 1 2" ]; then
+  ok "YAML list: a list item does not borrow the next item's label or name; a label on the dash line above its id is read"
+else bad "YAML list: a list item borrowed a neighbour's label, or lost its own (got exit ${rc}, yaml_ids $(yids "${WORK}/ylist.json"))" "${WORK}/out"; fi
+expect 0 ylist_quoted "YAML list: a double-quoted \\u escape is decoded, and a comment after a quoted value is not part of it" "ok=3 " "mismatch=0"
+run_tool --offline-map "${MAP}" --json "${WORK}/ylist.json" "${WORK}/ylist_flow"; rc=$?
+if [ $rc -eq 3 ] && has "${WORK}/out" "unlabelled ids : 2 distinct identifiers in YAML" && [ "$(yids "${WORK}/ylist.json")" = "2 0 2" ]; then
+  ok "YAML list: a YAML shape the reader does not know (flow mapping, bare list) is counted and printed as NOT checked, not dropped"
+else bad "YAML list: unread YAML identifiers must be counted (got exit ${rc}, yaml_ids $(yids "${WORK}/ylist.json"))" "${WORK}/out"; fi
+# The README's own YAML sample, run exactly as printed. It once carried a
+# comment after an unquoted id, which the reader takes as part of the value:
+# a stranger who copied the sample was told it held no pairs.
+README_MD=""
+for c in "${HERE}/README.md" "${HERE}/../../artifacts/validator-release/README.md"; do
+  if [ -f "$c" ]; then README_MD="$c"; break; fi
+done
+if [ -n "${README_MD}" ]; then
+  mkdir -p "${WORK}/readme_yaml"
+  awk '/^### YAML$/{s=1} s&&/^```yaml$/{f=1;next} f&&/^```$/{exit} f' "${README_MD}" > "${WORK}/readme_yaml/p.yaml"
+  run_tool --offline-map "${MAP}" "${WORK}/readme_yaml"; rc=$?
+  if [ -s "${WORK}/readme_yaml/p.yaml" ] && [ $rc -eq 0 ] && has "${WORK}/out" "ok=3 " && has "${WORK}/out" "pairs=3"; then
+    ok "README: the YAML sample, as printed, reads ok=3 pairs=3"
+  else bad "README: the YAML sample as printed should read ok=3 pairs=3 (got exit ${rc})" "${WORK}/out"; fi
+else
+  bad "README: README.md not found beside the selftest, so its YAML sample was not run" "${WORK}/out"
+fi
+
+
 # ── network cases ────────────────────────────────────────────────────────────
 echo ""
 echo "── NETWORK CASES (live EBI OLS4) ────────────────────────────────────────"
@@ -1361,7 +1788,7 @@ net_up=0
 if [ "${OFFLINE_ONLY}" -eq 1 ]; then
   echo "  SKIPPED BY REQUEST (--offline-only). The live-OLS4 cases below did NOT run;"
   echo "  the hermetic cases above do NOT prove the real resolver works."
-  SKIP=3
+  SKIP=4
 else
   curl -sSf --max-time 20 \
     "https://www.ebi.ac.uk/ols4/api/ontologies/ncit/terms?obo_id=NCIT%3AC51899" \
@@ -1390,11 +1817,22 @@ if [ ${net_up} -eq 1 ]; then
   if [ $rc -eq 4 ] && has "${WORK}/out" "unresolved=1" && has "${WORK}/out" "term-not-found-in-ols4"; then
     ok "live: NCIT:C99999999 -> UNRESOLVED (exit 4), not OK"
   else bad "live unresolved case failed (got exit ${rc})" "${WORK}/out"; fi
+
+  # N4 — field words, asked of the live service: a swap of two real NCIT terms is
+  # caught; a word that only names an imported property or an imported class is set aside.
+  mkdir -p "${WORK}/nl_live"
+  cat > "${WORK}/nl_live/t.py" <<'T'
+v = [("NCIT:C48910", "source"), ("NCIT:C25683", "subject"), ("MONDO:0000001", "object"), ("HP:0001250", "title")]
+T
+  run_tool "${WORK}/nl_live"; rc=$?
+  if [ $rc -eq 1 ] && has "${WORK}/out" "mismatch=2" && has "${WORK}/out" "not a label    : 2 pairs" && has "${WORK}/out" "ontology='Subject'"; then
+    ok "live: swapped NCIT field-word terms are MISMATCH; 'object' beside MONDO and 'title' beside HP are set aside"
+  else bad "live field-word case failed (got exit ${rc})" "${WORK}/out"; fi
 elif [ "${OFFLINE_ONLY}" -eq 0 ]; then
   echo "  !! SKIPPED — EBI OLS4 is UNREACHABLE from this host."
-  echo "  !! The three live cases did NOT run. This is not a pass."
+  echo "  !! The four live cases did NOT run. This is not a pass."
   [ -s "${WORK}/probe.err" ] && sed 's/^/  !! /' "${WORK}/probe.err"
-  SKIP=3
+  SKIP=4
 fi
 
 echo ""
